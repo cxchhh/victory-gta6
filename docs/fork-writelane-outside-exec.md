@@ -1,72 +1,72 @@
-# Open bug: `v_writelane_b32` is dropped when its lane is outside EXEC
+# `v_writelane_b32` and `v_readlane_b32` where their lane is not running
 
-Status: reproduced, not fixed. Written so that a person or a coding agent can pick it up.
+Status: fixed for the programs the wave can take together; the rest translate as before.
 
-## What is wrong
+## What was wrong
 
-On the console `v_writelane_b32 vN, sX, K` writes lane K whatever EXEC is. The translator
-lowers it as an ordinary vector write, under the guard of the lane that runs it
-(`crates/victory-shader/src/emit/lower.rs`, the `"v_writelane_b32"` arm, then
-`write_placed`). So when lane K is outside EXEC, or does not reach the block, the write is
-lost and a later `v_readlane_b32 sY, vN, K` gives the old value.
+On the console `v_writelane_b32 vN, sX, K` writes lane K whatever EXEC is, and
+`v_readlane_b32 sY, vN, K` reads it the same way. The translator lowered the write as an
+ordinary vector write, done by the lane itself: when lane K was outside EXEC, or did not
+reach the block, the write was lost and a later read gave the old value (or, for a lane
+that is not in the block at all, whatever the host gives).
 
-The compiler uses this pair to park scalars in VGPR lanes. `ir::unspill`
-(`crates/victory-shader/src/ir.rs`) turns the pairs into scalar moves, but only for a VGPR
-whose every use is such a pair with a constant lane. A VGPR with any other use keeps its
-lane writes, and those are the ones affected.
+`ir::unspill` (`crates/victory-shader/src/ir.rs`) turns such pairs into scalar moves, but
+only for a VGPR whose every use is a pair with a constant lane. What it leaves in this
+title's shader pack, translated for a 32-lane host:
 
-## Reproduce
+* 40 compute programs keep lane writes, 5,423 of them. All 40 are 32-lane programs, and
+  all are ray-tracing trace programs (`shadowmask:CS_TraceShadowRays_*`,
+  `rtdirectionalshadows:*`, `sr_tracing:CS_Raytrace*`, the screen-probe tracers, ...).
+* They keep a small array of scalars in the lanes of one VGPR: written by constant lane,
+  read by a computed one (`v_readlane_b32 s22, v29, s22`), and the VGPR is an ordinary
+  temporary elsewhere in the program. Hence no `unspill`.
+* Every one of those writes stands in a block that not every lane runs, with no guard: the
+  lane written is simply not there when it left through an early-out.
+* No 64-lane program keeps a lane write. The 14 `CS_ShadowRenderTiled*` programs of
+  issue #62 are not among the 40, so this is not what is wrong with them.
 
-```
-cargo test -p victory-shader --lib a_lane_write_reaches_its_lane_outside_exec -- --ignored --nocapture
-```
+## What the lowering does now
 
-The test is in `crates/victory-shader/src/emit/wave64_tests.rs`. It needs a hardware device
-with shader model 6.6; without one it prints `not run` and passes, which is not a result.
-On Windows 10 the in-box D3D12 stops at 6.5 (PR #69 adds the newer runtime).
+`crates/victory-shader/src/emit/lower.rs`, the two arms and `Lower::lane_there`:
 
-Program: one console wave of 64, `if (t > s0) { v_writelane_b32 v9, s6, 0 }` with s6 = 5 and
-v9 = 7 before, then every thread stores `v_readlane_b32` of lane 0.
+* A lane write, or a lane read of a VGPR that lane writes fill, in a block only some lanes
+  run is refused (`LANE_ELSEWHERE`), naming the block.
+* `emit` then has the wave take the branches around that block together (`widen`), so
+  every lane is there. Where the host's waves are the console's, as for the 40 programs,
+  that costs no barrier. A console wave run as two host waves goes through its forms
+  without skips instead.
+* Under a guard (lanes there with EXEC clear) the lane takes the scalar when some lane of
+  the console wave is in EXEC, with or without its own bit. Two host waves of 32 exchange
+  their answers.
+* If the branches cannot be taken together, the program is translated as before
+  (`with_lanes_as_they_stand`): no program stops translating.
 
-| s0 | threads inside | expected | got (RTX 3090, 32-lane waves) |
-|----|----------------|----------|-------------------------------|
-| 10 | 11..63, lane 0 outside | 5 | 7 |
-| 62 | 63, lane 0 outside | 5 | 7 |
-| 63 | none (the wave skips) | 7 | 7 |
+Measured on the pack (`VICTORY_HOST_MAX_WAVE=32 victory translate --validate`), before and
+after: 2,669 of 2,682 compute programs emitted and validated both times. Of the 40
+programs, 36 translate either way and all 36 get a pipeline on an RTX 5080: 25 now with
+their branches wave-wide (6 to 131 branches each), 11 as before. Those 11 stop wave-wide on
+"a descriptor's address or format read as data" (10) and "a constant buffer's descriptor
+read as data" (1): `VICTORY_WAVE_WHY=1` prints `LANE-ELSEWHERE ...` with the reason.
 
-The same in all three forms: as is, `ir::without_skips(p, false)`, `ir::without_skips(p, true)`.
-The control with lane 0 inside (`t < s0`) gives 5 and 7 as it should.
+## Tests
 
-"Expected" is the instruction's documented behaviour (it ignores EXEC), which `unspill`
-already relies on. It has not been measured on a console.
+`crates/victory-shader/src/emit/wave64_tests.rs`; both need a hardware device with shader
+model 6.6 and print `not run` without one.
 
-## What a fix must do
+* `a_lane_write_reaches_its_lane_outside_exec`: a console wave of 64 on a 32-lane host.
+* `a_lane_array_is_written_and_read_with_the_skip_wave_wide`: a 32-lane wave, the trace
+  programs' pattern.
 
-Lane K takes the scalar exactly when the console wave executes the instruction:
+## Not known, not done
 
-* some lane of the console wave is in EXEC there: write, even if lane K is not;
-* no lane is (the console took the `s_cbranch_execz` skip): do not write. Making the write
-  unconditional breaks the `s0 = 63` row in the forms without skips.
-
-Two ways, cheapest first:
-
-1. At translation time: let `unspill` take a parking VGPR that has other uses when the
-   parked lanes' live ranges do not overlap those uses. No cost per frame, and the program
-   may then not need 64-lane waves at all.
-2. At run time: write under "some lane of the console wave is in EXEC" (a ballot; across
-   two host waves an exchange, which costs group barriers). Only where 1 cannot apply.
-
-## Done when
-
-* the test passes without `#[ignore]` on a 32-lane card and on a 64-lane one;
-* `cargo test --workspace` passes;
-* `victory translate --validate` over a title's shaders translates no fewer programs than before.
-
-## Not known yet
-
-Whether this is what makes the 14 `CS_ShadowRenderTiled*` programs wrong in the "without
-skips, scalars followed" form (issue #62). To check: `VICTORY_HOST_WAVE=32 VICTORY_WAVE_WHY=1
-victory translate --list` and see whether those programs name `v_writelane` / `v_readlane`.
-
-Ruled out for #62: a loop running to the loop limit inside a region whose skip was left
-out. A conditional back edge leaves the loop at the limit and the program goes on.
+* "Expected" is the instruction's documented behaviour (it ignores EXEC). It has not been
+  measured on a console.
+* Not checked in the game: the 25 programs' cost with their branches wave-wide, and
+  whether their results change. Ray tracing lights nothing yet (see
+  `docs/fork-ray-tracing.md`).
+* Not run on a 64-lane card.
+* The 11 programs left as before. Keeping the lanes of such a VGPR as scalars in
+  `ir::unspill` (a VGPR with other uses, computed lane reads) would settle those too, at
+  no cost per frame.
+* Under a guard, "the wave is here" is read as "some lane is in EXEC". A wave that walks
+  on with EXEC empty and no skip writes too on the console.
