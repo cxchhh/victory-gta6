@@ -3398,6 +3398,10 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            // (the operations that make it, when they are scalar ones: `mask_number`)
+            if let Ok(r) = self.mask_number(lo, high) {
+                return Ok(r);
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
@@ -3444,6 +3448,73 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// The instruction writing `v` (a scan: only on the way to a refusal).
+    fn def(&self, v: Value) -> Option<&'a Inst> {
+        self.x.p.blocks.iter().flat_map(|b| b.insts.iter()).find(|i| i.writes.iter().any(|w| w.1 == v))
+    }
+
+    /// A lane mask holding lanes not running where it is written (the NOT
+    /// of a compare's result, `s_xor_b32 s, vcc, -1`): no ballot gives it
+    /// there, but it is the scalar operation of masks and numbers that
+    /// does, and each of those is a ballot (or a number) in turn: the
+    /// console's mask bit for bit. wave32 only.
+    fn mask_number(&mut self, v: Value, high: bool) -> Result<V, Why> {
+        const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+        if let Some(&(x, y)) = self.ballots.get(&v) {
+            return Ok(if high { y } else { x });
+        }
+        let inst = self.def(v).ok_or(ELSEWHERE)?;
+        let (Fields::Sop { src, .. }, false) = (&inst.fields, self.x.native.wave64) else {
+            return Err(ELSEWHERE);
+        };
+        if inst.writes.first().map(|w| w.1) != Some(v) {
+            return Err(ELSEWHERE);
+        }
+        let name = inst.name();
+        let mut x = Vec::with_capacity(src.len());
+        for op in src {
+            x.push(self.operand(inst, &op)?);
+        }
+        let at = match self.def_block.get(&v) {
+            Some(&b) if b == self.cur_ir => self.cur,
+            Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+            None => return Err(ELSEWHERE),
+        };
+        let ones = self.s.m.i32(u32::MAX);
+        let m = &mut self.s.m;
+        let not = |m: &mut super::bitcode::Module, a: V| m.bin(at, Bin::Xor, a, ones);
+        let r = match (name, x.as_slice()) {
+            ("s_mov_b32", &[a]) => a,
+            ("s_not_b32", &[a]) => not(m, a),
+            ("s_and_b32", &[a, b]) => m.bin(at, Bin::And, a, b),
+            ("s_or_b32", &[a, b]) => m.bin(at, Bin::Or, a, b),
+            ("s_xor_b32", &[a, b]) => m.bin(at, Bin::Xor, a, b),
+            ("s_andn2_b32", &[a, b]) => {
+                let nb = not(m, b);
+                m.bin(at, Bin::And, a, nb)
+            }
+            ("s_orn2_b32", &[a, b]) => {
+                let nb = not(m, b);
+                m.bin(at, Bin::Or, a, nb)
+            }
+            ("s_nand_b32", &[a, b]) => {
+                let r = m.bin(at, Bin::And, a, b);
+                not(m, r)
+            }
+            ("s_nor_b32", &[a, b]) => {
+                let r = m.bin(at, Bin::Or, a, b);
+                not(m, r)
+            }
+            ("s_xnor_b32", &[a, b]) => {
+                let r = m.bin(at, Bin::Xor, a, b);
+                not(m, r)
+            }
+            _ => return Err(ELSEWHERE),
+        };
+        self.ballots.insert(v, (r, r));
+        Ok(r)
     }
 
     // ---- operands ----
