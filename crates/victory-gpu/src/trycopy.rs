@@ -159,4 +159,59 @@ mod tests {
         }
         assert_eq!(SEEN.load(Ordering::Relaxed), 0);
     }
+
+    /// What a guard costs under this system: setting a 64 KiB block
+    /// read-only, and a write to it that faults, is taken by a vectored
+    /// handler which gives the access back, and goes on. `cargo test
+    /// guard_fault_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn guard_fault_cost() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BASE: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn reopen(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes the exception being dispatched.
+            unsafe {
+                let r = &*(*info).ExceptionRecord;
+                let at = r.ExceptionInformation[1];
+                let base = BASE.load(Ordering::Relaxed);
+                if r.ExceptionCode as NTSTATUS == EXCEPTION_ACCESS_VIOLATION && at >= base && at < base + (64 << 20) {
+                    let mut old = 0;
+                    mem::VirtualProtect((at & !0xffff) as *const _, 1 << 16, mem::PAGE_READWRITE, &mut old);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+            EXCEPTION_CONTINUE_SEARCH
+        }
+        const N: usize = 1000;
+        // SAFETY: an allocation and a handler of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 64 << 20, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            BASE.store(base as usize, Ordering::Relaxed);
+            for b in 0..N.min(1024) {
+                *base.add(b << 16) = 1;
+            }
+            let h = AddVectoredExceptionHandler(1, Some(reopen));
+            let mut old = 0;
+            let t = std::time::Instant::now();
+            for b in 0..N {
+                mem::VirtualProtect(base.add((b % 1024) << 16).cast(), 1 << 16, mem::PAGE_READONLY, &mut old);
+            }
+            let protect = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+            let t = std::time::Instant::now();
+            for b in 0..N {
+                std::ptr::write_volatile(base.add((b % 1024) << 16), 2);
+            }
+            let fault = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+            let t = std::time::Instant::now();
+            for b in 0..N {
+                std::ptr::write_volatile(base.add((b % 1024) << 16), 3);
+            }
+            let plain = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+            windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler(h);
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+            eprintln!("setting a 64 KiB block read-only: {protect:.2} us; a write that faults and is given access back (handler's VirtualProtect included): {fault:.2} us; a plain write: {plain:.3} us");
+        }
+    }
 }
+

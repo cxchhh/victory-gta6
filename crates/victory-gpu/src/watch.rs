@@ -1558,4 +1558,53 @@ mod mapping_tests {
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
     }
+
+    /// What one write-watch asking (with reset) costs against the size of
+    /// the range asked, with 2% of its pages written: whether many small
+    /// askings can become a few large ones. `cargo test write_watch_cost
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn write_watch_cost() {
+        use windows_sys::Win32::System::Memory as mem;
+        const TOTAL: usize = 4 << 30;
+        // SAFETY: an allocation of the test's own, written and asked about.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), TOTAL, mem::MEM_RESERVE | mem::MEM_COMMIT | 0x20_0000 /* MEM_WRITE_WATCH */, mem::PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            for page in (0..TOTAL / 4096).step_by(1) {
+                *base.add(page * 4096) = 1;
+            }
+            let mut found = vec![0usize; TOTAL / 4096];
+            for size in [64usize << 10, 1 << 20, 16 << 20, 256 << 20, 1 << 30, 4 << 30] {
+                let n = (64 << 20) / size.min(64 << 20);
+                let started = std::time::Instant::now();
+                let mut written = 0;
+                for i in 0..n.max(4) {
+                    let at = base.add((i * size) % TOTAL.saturating_sub(size).max(1));
+                    // 2% of the pages written since the last asking.
+                    for page in (0..size / 4096).step_by(50) {
+                        *at.add(page * 4096) = 2;
+                    }
+                    let (mut count, mut granularity) = (size / 4096, 0);
+                    mem::GetWriteWatch(1, at.cast(), size, found.as_mut_ptr().cast(), &mut count, &mut granularity);
+                    written += count;
+                }
+                let per = started.elapsed().as_secs_f64() * 1e6 / n.max(4) as f64;
+                eprintln!("{:>6} MiB: {per:9.1} us an asking (writes included), {} pages found", size >> 20, written / n.max(4));
+            }
+            // The askings alone: nothing written in between.
+            for size in [64usize << 10, 1 << 20, 256 << 20, 4 << 30] {
+                let mut granularity = 0;
+                let started = std::time::Instant::now();
+                for _ in 0..4 {
+                    let mut count = size / 4096;
+                    mem::GetWriteWatch(1, base.cast(), size, found.as_mut_ptr().cast(), &mut count, &mut granularity);
+                }
+                eprintln!("{:>6} MiB: {:9.1} us an asking, nothing written", size >> 20, started.elapsed().as_secs_f64() * 1e6 / 4.0);
+            }
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
 }
+
