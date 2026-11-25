@@ -336,6 +336,34 @@ fn translate(
     if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
         return;
     }
+    // `VICTORY_TRANSLATE_SKIP=<hash prefix>,...`: those containers are left out.
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if skip.iter().any(|o| hash.starts_with(o.as_str())) {
+        return;
+    }
+    // A line on stderr every 30 s: containers taken so far.
+    static TAKEN: AtomicUsize = AtomicUsize::new(0);
+    static TICKER: std::sync::Once = std::sync::Once::new();
+    TICKER.call_once(|| {
+        let started = std::time::Instant::now();
+        let _ = std::thread::Builder::new().name("progress".into()).spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            eprintln!(
+                "progress {} s: {} containers taken",
+                started.elapsed().as_secs(),
+                TAKEN.load(Ordering::Relaxed)
+            );
+        });
+    });
+    TAKEN.fetch_add(1, Ordering::Relaxed);
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
