@@ -4876,13 +4876,9 @@ impl Host {
                     }
                 }
                 relay_hand_back(&back);
-                // Only now, and flight by flight: a range another flight
-                // in the air declared too stays closed to refreshes.
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        shadow.copy_back_done(ranges);
-                    }
-                }
+                // The declared ranges are released at the end of
+                // `relay_land`, once (after `line.written` and the waiters):
+                // released here too they were counted down twice.
                 copy_back(0, landing.elapsed().as_micros() as u64);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
