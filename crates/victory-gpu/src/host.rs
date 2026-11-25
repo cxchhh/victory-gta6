@@ -6124,6 +6124,12 @@ impl Host {
         unsafe impl Send for Gdi {}
         static GDI: Mutex<Option<Gdi>> = Mutex::new(None);
         let mut gdi = GDI.lock().unwrap_or_else(|e| e.into_inner());
+        if gdi.is_none() && crate::gdi::headless() {
+            let copy = self.new_list().ok()?;
+            copy.close();
+            tracing::info!(width, height, "presenting nowhere: frames are only counted (VICTORY_GDI_PRESENT=headless)");
+            *gdi = Some(Gdi(HWND::default(), copy, Meter::new()));
+        }
         if gdi.is_none() {
             let hwnd = match title_window() {
                 Some(hwnd) => hwnd,
@@ -6141,7 +6147,9 @@ impl Host {
             *gdi = Some(Gdi(hwnd, copy, Meter::new()));
         }
         let Gdi(hwnd, copy, meter) = gdi.as_mut()?;
-        if crate::gdi::wanted(frame) {
+        let shot = crate::gdi::shot(frame);
+        let draw = !crate::gdi::headless() && crate::gdi::wanted(frame);
+        if draw || shot.is_some() {
             let state = D3D12_RESOURCE_STATES(state as i32);
             copy.reset();
             let list = &copy.list;
@@ -6155,7 +6163,12 @@ impl Host {
             copy.close();
             self.execute(&[copy]);
             if let Some((buffer, footprint)) = read {
-                crate::gdi::blit(*hwnd, &buffer, &footprint);
+                if let Some(path) = &shot {
+                    crate::gdi::save(path, &buffer, &footprint);
+                }
+                if draw {
+                    crate::gdi::blit(*hwnd, &buffer, &footprint);
+                }
             }
         }
         meter.frame(*hwnd);

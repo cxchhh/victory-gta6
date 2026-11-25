@@ -5,7 +5,13 @@
 //! a GPU whose display output is disabled, such as data-centre cards: the
 //! driver answers `VK_ERROR_UNKNOWN` for every surface query), while the
 //! window itself, on an X server, can be seen and recorded.
-//! `VICTORY_GDI_PRESENT=<n>` draws every n-th frame only.
+//! `VICTORY_GDI_PRESENT=<n>` draws every n-th frame only;
+//! `VICTORY_GDI_PRESENT=headless`: no window and nothing drawn, frames are
+//! only counted (the frame rate is logged).
+//!
+//! `VICTORY_SHOT_FILE=<path>`: whenever that file appears, the next frame
+//! is saved as a PNG beside it (named by the file's text, else by the
+//! frame number) and the file is removed: screenshots on request.
 
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -18,11 +24,12 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
-/// Every how many frames one is drawn; 0: off.
+/// Every how many frames one is drawn; 0: off; `u64::MAX`: headless.
 fn every() -> u64 {
     static EVERY: OnceLock<u64> = OnceLock::new();
     *EVERY.get_or_init(|| match std::env::var("VICTORY_GDI_PRESENT") {
         Ok(v) if v.trim() == "0" || v.trim().is_empty() => 0,
+        Ok(v) if v.trim().eq_ignore_ascii_case("headless") => u64::MAX,
         Ok(v) => v.trim().parse().unwrap_or(1).max(1),
         Err(_) => 0,
     })
@@ -31,6 +38,52 @@ fn every() -> u64 {
 /// Whether frames go to the window through GDI instead of the swap chain.
 pub(crate) fn on() -> bool {
     every() != 0
+}
+
+/// Whether there is no window at all (`VICTORY_GDI_PRESENT=headless`).
+pub(crate) fn headless() -> bool {
+    every() == u64::MAX
+}
+
+/// With `VICTORY_SHOT_FILE`: the path to save this frame to, when the
+/// request file is there (looked for at most four times a second).
+pub(crate) fn shot(frame: u64) -> Option<std::path::PathBuf> {
+    static FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let file = FILE.get_or_init(|| std::env::var_os("VICTORY_SHOT_FILE").map(Into::into)).as_ref()?;
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < Duration::from_millis(250)) {
+            return None;
+        }
+        *last = Some(now);
+    }
+    let text = std::fs::read_to_string(file).ok()?;
+    let _ = std::fs::remove_file(file);
+    let name: String = text.trim().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+    let name = if name.is_empty() { format!("shot-{frame}") } else { name };
+    Some(file.with_file_name(format!("{name}.png")))
+}
+
+/// Saves a frame read back by [`crate::capture::read_back`] (the copy has
+/// finished) as a PNG at `path`.
+pub(crate) fn save(path: &std::path::Path, buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT) {
+    let f = footprint.Footprint;
+    let (width, height, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copy finished; the mapping spans the footprint's rows.
+    unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() {
+            return;
+        }
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * height);
+        // Full size BGRA, then half size on writing.
+        if let Some(bgra) = to_bgra(f.Format.0 as u32, [width, height, pitch], [width, height], rows) {
+            crate::capture::write_png(path, width as u32, height as u32, width * 4, true, &bgra);
+        }
+        buffer.Unmap(0, None);
+    }
 }
 
 /// Whether frame `frame` is to be drawn: every n-th, at most 15 a second.
