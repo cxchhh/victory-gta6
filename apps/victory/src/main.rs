@@ -153,6 +153,8 @@ fn main() -> Result<()> {
             list,
             jobs,
         } => {
+            #[cfg(windows)]
+            victory_loader::report_crashes();
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);

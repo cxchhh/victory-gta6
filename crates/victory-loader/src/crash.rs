@@ -22,7 +22,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-    GetModuleFileNameW, GetModuleHandleExW,
+    GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW,
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
@@ -120,8 +120,74 @@ pub fn report_crashes() {
     // ours and calls `report_unhandled` first.
     unsafe {
         AddVectoredExceptionHandler(0, Some(handler));
+        AddVectoredExceptionHandler(1, Some(overflow_first));
         SetUnhandledExceptionFilter(Some(filter));
     }
+}
+
+/// Called first for every exception: on a stack overflow, the return
+/// addresses inside our own image found on the first 32 KiB of the stack
+/// above the fault, as image offsets, written with no formatting and no
+/// stack to speak of (the reporters after it overflow again under Wine).
+/// One report per process.
+unsafe extern "system" fn overflow_first(info: *mut EXCEPTION_POINTERS) -> i32 {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static mut LINE: [u8; 64 * 1024] = [0; 64 * 1024];
+    // SAFETY: the system passes valid exception pointers.
+    let (code, rsp, rip) = unsafe {
+        let i = &*info;
+        ((*i.ExceptionRecord).ExceptionCode, (*i.ContextRecord).Rsp as usize, (*i.ContextRecord).Rip as usize)
+    };
+    if code != EXCEPTION_STACK_OVERFLOW || DONE.swap(true, Ordering::AcqRel) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: our own image's headers.
+    let (base, size) = unsafe {
+        let base = GetModuleHandleW(null_mut()) as usize;
+        let pe = base + *((base + 0x3c) as *const u32) as usize;
+        (base, *((pe + 0x18 + 0x38) as *const u32) as usize)
+    };
+    let (mut low, mut high) = (0usize, 0usize);
+    // SAFETY: out pointers of ours.
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    let _ = low;
+    // SAFETY: a static only this one call (guarded by DONE) writes.
+    let line = unsafe { &mut *std::ptr::addr_of_mut!(LINE) };
+    let mut n = 0;
+    let mut put = |b: &[u8], n: &mut usize| {
+        for &c in b {
+            if *n < line.len() {
+                line[*n] = c;
+                *n += 1;
+            }
+        }
+    };
+    let hex = |v: usize, out: &mut [u8; 16]| {
+        for (i, o) in out.iter_mut().enumerate() {
+            let d = (v >> ((15 - i) * 4)) & 15;
+            *o = b"0123456789abcdef"[d];
+        }
+    };
+    let mut h = [0u8; 16];
+    put(b"VIctory: stack overflow; image offsets above the fault: rip ", &mut n);
+    hex(rip.wrapping_sub(base), &mut h);
+    put(&h, &mut n);
+    let top = high.min(rsp + 32 * 1024);
+    let mut at = rsp & !7;
+    while at + 8 <= top {
+        // SAFETY: inside this thread's committed stack, above the fault.
+        let v = unsafe { *(at as *const usize) };
+        if v > base && v < base + size {
+            put(b" ", &mut n);
+            hex(v - base, &mut h);
+            put(&h, &mut n);
+        }
+        at += 8;
+    }
+    put(b"\n", &mut n);
+    raw_line(&line[..n]);
+    EXCEPTION_CONTINUE_SEARCH
 }
 
 /// What the vectored handler reports as it happens.
