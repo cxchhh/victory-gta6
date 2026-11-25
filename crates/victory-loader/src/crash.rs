@@ -170,9 +170,41 @@ unsafe extern "system" fn overflow_first(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
     };
     let mut h = [0u8; 16];
-    put(b"VIctory: stack overflow; image offsets above the fault: rip ", &mut n);
-    hex(rip.wrapping_sub(base), &mut h);
+    put(b"VIctory: stack overflow; working on ", &mut n);
+    CURRENT.with(|c| {
+        let c = c.get();
+        let len = c.iter().position(|&b| b == 0).unwrap_or(c.len());
+        put(&c[..len], &mut n);
+    });
+    put(b"; rip ", &mut n);
+    hex(rip, &mut h);
     put(&h, &mut n);
+    put(b" in ", &mut n);
+    {
+        static mut NAME: [u16; 260] = [0; 260];
+        let mut module: HMODULE = null_mut();
+        // SAFETY: plain queries into a static only this call writes.
+        unsafe {
+            let name = &mut *std::ptr::addr_of_mut!(NAME);
+            if GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                rip as *const u16,
+                &mut module,
+            ) != 0
+            {
+                let len = GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) as usize;
+                for &w in &name[..len] {
+                    put(&[if w < 128 { w as u8 } else { b'?' }], &mut n);
+                }
+                put(b" +", &mut n);
+                hex(rip - module as usize, &mut h);
+                put(&h, &mut n);
+            } else {
+                put(b"(no module)", &mut n);
+            }
+        }
+    }
+    put(b"; our image offsets above the fault:", &mut n);
     let top = high.min(rsp + 32 * 1024);
     let mut at = rsp & !7;
     while at + 8 <= top {
@@ -452,6 +484,20 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
     }
     EXCEPTION_CONTINUE_SEARCH
+}
+
+thread_local! {
+    /// What this thread works on, for the stack overflow report ([`note_current`]).
+    static CURRENT: std::cell::Cell<[u8; 48]> = const { std::cell::Cell::new([0; 48]) };
+}
+
+/// Notes what this thread works on now (a shader's hash, say): a stack
+/// overflow report names it.
+pub fn note_current(what: &str) {
+    let mut b = [0u8; 48];
+    let len = what.len().min(47);
+    b[..len].copy_from_slice(&what.as_bytes()[..len]);
+    CURRENT.with(|c| c.set(b));
 }
 
 thread_local! {
