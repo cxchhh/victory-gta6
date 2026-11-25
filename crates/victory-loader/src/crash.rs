@@ -129,19 +129,24 @@ pub fn report_crashes() {
 /// addresses inside our own image found on the first 32 KiB of the stack
 /// above the fault, as image offsets, written with no formatting and no
 /// stack to speak of (the reporters after it overflow again under Wine).
-/// One report per process.
+/// At most 16 reports per process.
 unsafe extern "system" fn overflow_first(info: *mut EXCEPTION_POINTERS) -> i32 {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static DONE: AtomicBool = AtomicBool::new(false);
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+    static BUSY: AtomicBool = AtomicBool::new(false);
     static mut LINE: [u8; 64 * 1024] = [0; 64 * 1024];
     // SAFETY: the system passes valid exception pointers.
     let (code, rsp, rip) = unsafe {
         let i = &*info;
         ((*i.ExceptionRecord).ExceptionCode, (*i.ContextRecord).Rsp as usize, (*i.ContextRecord).Rip as usize)
     };
-    if code != EXCEPTION_STACK_OVERFLOW || DONE.swap(true, Ordering::AcqRel) {
+    if code != EXCEPTION_STACK_OVERFLOW
+        || REPORTS.load(Ordering::Acquire) >= 16
+        || BUSY.swap(true, Ordering::AcqRel)
+    {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    REPORTS.fetch_add(1, Ordering::AcqRel);
     // SAFETY: our own image's headers.
     let (base, size) = unsafe {
         let base = GetModuleHandleW(null_mut()) as usize;
@@ -152,7 +157,7 @@ unsafe extern "system" fn overflow_first(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: out pointers of ours.
     unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
     let _ = low;
-    // SAFETY: a static only this one call (guarded by DONE) writes.
+    // SAFETY: a static only the call holding BUSY writes.
     let line = unsafe { &mut *std::ptr::addr_of_mut!(LINE) };
     let mut n = 0;
     let mut put = |b: &[u8], n: &mut usize| {
@@ -197,6 +202,7 @@ unsafe extern "system" fn overflow_first(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     put(b"\n", &mut n);
     raw_line(&line[..n]);
+    BUSY.store(false, Ordering::Release);
     EXCEPTION_CONTINUE_SEARCH
 }
 

@@ -293,6 +293,12 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Loop headers with more than one back edge, and the latch block their
+    /// back edges branch to instead, one back edge to the header (see
+    /// [`Lower::through_latch`]).
+    latches: HashMap<usize, usize>,
+    /// The counts the back edges of a latched loop give its latch.
+    latch_counts: HashMap<usize, Vec<(V, usize)>>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
 }
@@ -1566,6 +1572,8 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            latches: HashMap::new(),
+            latch_counts: HashMap::new(),
             abort: None,
         }
     }
@@ -2135,6 +2143,21 @@ impl<'a> Lower<'a> {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
+                // dxil-spirv's structurizer takes one back edge per loop, as
+                // DXC emits them: more go through one latch block (the
+                // console's code returns to a loop's top from several places;
+                // the ray-traced shadow traces' BVH walks among them, where
+                // it recursed without end). From the Proton fork's `loopfix`.
+                let back = p.blocks[b]
+                    .preds
+                    .iter()
+                    .filter(|&&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q])
+                    .count();
+                if back > 1 {
+                    let latch = self.s.m.new_block();
+                    self.s.m.terminate(latch, Term::Br(blk));
+                    self.latches.insert(b, latch);
+                }
             }
         }
         self.cur = self.s.entry;
@@ -10936,7 +10959,8 @@ impl<'a> Lower<'a> {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
                 let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                let to = self.latches.get(&t).copied();
+                Term::CondBr(ok, to.unwrap_or(self.block[t].expect("reachable")), abort)
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
@@ -10984,7 +11008,10 @@ impl<'a> Lower<'a> {
                     self.cur = latch;
                     let ok = self.count_iteration(not_taken, pred::IULT);
                     let abort = self.abort_block();
-                    let top = self.block[not_taken].expect("reachable");
+                    let top = match self.latches.get(&not_taken) {
+                        Some(&l) => l,
+                        None => self.block[not_taken].expect("reachable"),
+                    };
                     self.s.m.terminate(latch, Term::CondBr(ok, top, abort));
                     self.cur = here;
                     self.edges.insert((b, not_taken), latch);
@@ -11067,11 +11094,15 @@ impl<'a> Lower<'a> {
             named => named,
         };
         let limit = self.s.m.i32(limit);
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
+        if self.latches.contains_key(&to) {
+            self.latch_counts.entry(to).or_default().push((next, c));
+        } else {
+            self.counters
+                .get_mut(&to)
+                .expect("header")
+                .1
+                .push((next, c));
+        }
         let over = self.s.m.cmp(c, p, next, limit);
         self.s.m.tag(over, Tag::Counter);
         over
@@ -11104,7 +11135,12 @@ impl<'a> Lower<'a> {
         // Back edges stay as they are: the exiting block is the latch (or
         // the latch block of its own a second back edge got, see `exit`).
         if self.rpo[to] <= self.rpo[from] {
-            return self.edges.get(&(from, to)).copied().unwrap_or(target);
+            return self
+                .edges
+                .get(&(from, to))
+                .or_else(|| self.latches.get(&to))
+                .copied()
+                .unwrap_or(target);
         }
         if preds < 2 {
             return target;
@@ -11133,8 +11169,9 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
-                incoming.push((x, qb));
+                incoming.push((q, x, qb));
             }
+            let incoming = self.through_latch(b, self.s.t.i1, incoming);
             self.s.m.set_phi(v, incoming);
         }
         // A join that only another join reads is read wherever that one is. Left
@@ -11251,14 +11288,39 @@ impl<'a> Lower<'a> {
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
                 };
-                incoming.push((x, qb));
+                incoming.push((q, x, qb));
             }
+            let ty = if bit { self.s.t.i1 } else { self.s.t.i32 };
+            let incoming = self.through_latch(b, ty, incoming);
             self.s.m.set_phi(v, incoming);
         }
-        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+        for (b, (phi, mut incoming)) in std::mem::take(&mut self.counters) {
+            if let Some(&latch) = self.latches.get(&b) {
+                let back = self.latch_counts.remove(&b).unwrap_or_default();
+                let joined = self.s.m.phi(latch, self.s.t.i32);
+                self.s.m.set_phi(joined, back);
+                incoming.push((joined, latch));
+            }
             self.s.m.set_phi(phi, incoming);
         }
         Ok(())
+    }
+
+    /// The incoming values of a phi at the entry of IR block `b`, from one
+    /// (IR predecessor, value, DXIL block) per edge: a latched loop's back
+    /// edges come through its latch, where a phi of `ty` joins their values
+    /// first (see [`Lower::latches`]).
+    fn through_latch(&mut self, b: usize, ty: crate::emit::bitcode::Ty, incoming: Vec<(usize, V, usize)>) -> Vec<(V, usize)> {
+        let Some(&latch) = self.latches.get(&b) else {
+            return incoming.into_iter().map(|(_, x, at)| (x, at)).collect();
+        };
+        let (back, forward): (Vec<_>, Vec<_>) =
+            incoming.into_iter().partition(|&(q, _, _)| self.rpo[b] <= self.rpo[q]);
+        let joined = self.s.m.phi(latch, ty);
+        self.s.m.set_phi(joined, back.into_iter().map(|(_, x, at)| (x, at)).collect());
+        let mut out: Vec<(V, usize)> = forward.into_iter().map(|(_, x, at)| (x, at)).collect();
+        out.push((joined, latch));
+        out
     }
 }
 
