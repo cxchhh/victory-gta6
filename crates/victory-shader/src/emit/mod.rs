@@ -185,32 +185,17 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
-/// Everything a translation depends on besides the container: the
-/// translator's own source (hashed at build time), the value of every
-/// `VICTORY_*` switch it reads, the host facts the device hands it (widest
-/// wave, view heap limit) and the settings above. The shader cache keys on
-/// this instead of on the whole executable, so a rebuild that leaves the
-/// translator alone keeps its translations. Call it after the device is made.
-/// The programs kept from the deep-skips form unless
-/// `VICTORY_WAVE_DEEP_SKIPS_NOT` says otherwise.
-const DEEP_SKIPS_NOT: &str = "_9945271c";
-
 /// Whether the deep-skips form is kept from this program:
 /// `VICTORY_WAVE_DEEP_SKIPS_NOT=<name part>,...` names programs by a part of
-/// a name their container holds. The cascaded shadow programs built from
-/// one source (`CS_ShadowRenderTiled*_9945271c`, fxceless/victory-fork#62)
-/// come out of that form with screen-aligned blocks of other places'
-/// colour on the characters (run vx2, 2026-11-25); without it they take
-/// the next form.
-///
-/// By default that family ([`DEEP_SKIPS_NOT`]): 14 of its 17 programs
-/// come out otherwise, all validated; the other 3 never took that form.
-/// Set empty, every program may take it.
+/// a name their container holds; they take the next form. None by default:
+/// keeping the cascaded shadow programs (`_9945271c`, blamed for the
+/// screen-aligned blocks in fxceless/victory-fork#62) out left the blocks
+/// as they were (run vx3, 2026-11-25: the same tiles at the same places).
 fn deep_skips_not(c: &Container) -> bool {
     static NOT: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
     let not = NOT.get_or_init(|| {
         std::env::var("VICTORY_WAVE_DEEP_SKIPS_NOT")
-            .unwrap_or_else(|_| DEEP_SKIPS_NOT.to_owned())
+            .unwrap_or_default()
             .split(',')
             .map(str::trim)
             .filter(|n| !n.is_empty())
@@ -227,6 +212,12 @@ fn names_any(c: &Container, names: &[Vec<u8>]) -> bool {
     })
 }
 
+/// Everything a translation depends on besides the container: the
+/// translator's own source (hashed at build time), the value of every
+/// `VICTORY_*` switch it reads, the host facts the device hands it (widest
+/// wave, view heap limit) and the settings above. The shader cache keys on
+/// this instead of on the whole executable, so a rebuild that leaves the
+/// translator alone keeps its translations. Call it after the device is made.
 pub fn translation_fingerprint() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
@@ -2153,7 +2144,7 @@ mod deep_skips_not_tests {
             version: (1, 0),
             parts: vec![Part { fourcc: FourCC::DXIL, offset: 0, data }],
         };
-        assert!(names_any(&c, &[DEEP_SKIPS_NOT.as_bytes().to_vec()]));
+        assert!(names_any(&c, &[b"_9945271c".to_vec()]));
         assert!(!names_any(&c, &[b"_00000000".to_vec()]));
         assert!(!names_any(&c, &[]));
     }
