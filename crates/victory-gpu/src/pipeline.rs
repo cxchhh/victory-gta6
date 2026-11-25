@@ -137,6 +137,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by address (`global_store_*`,
+    /// `global_atomic_*`: [`raw_stores`]); true when its code is not known.
+    pub(crate) raw_stores: bool,
 }
 
 #[cfg(windows)]
@@ -195,6 +198,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let raw_stores = programs.is_empty() || programs.iter().any(raw_stores);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -205,7 +209,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, raw_stores })
 }
 
 /// The vertex and geometry shaders of a pipeline with a geometry stage: the
@@ -242,6 +246,7 @@ pub(crate) fn merged_pair(es: &Shader, gs: &Shader) -> Result<(Arc<Shader>, Arc<
                     host,
                     used: native.used.clone(),
                     stores: stores(native),
+                    raw_stores: raw_stores(native),
                 }));
                 Arc::new(Shader {
                     stage,
@@ -437,6 +442,14 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
+/// Whether the builder runs whole now (made whole by [`builder_runs`] and
+/// not turned off since).
+#[cfg(windows)]
+pub(crate) fn builder_whole() -> bool {
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    b.whole && !b.off
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
@@ -508,6 +521,30 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Global => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store to title memory by address: a
+/// global or flat store or atomic (the only stores the translation sends
+/// through `victory_shader::emit::SLOT_MEMORY`), or code that is not all
+/// known. A shader that reads title memory by address but stores only
+/// through its views (the programs that walk ray-tracing structures) need
+/// not have every numbered copy of `crate::memory` declared written.
+#[cfg(windows)]
+fn raw_stores(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Flat | Encoding::Global => {
+                name.is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+            }
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }

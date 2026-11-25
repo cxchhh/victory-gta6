@@ -38,8 +38,20 @@
 //! memory module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
+//! there are at most [`copies`] of them (4 MiB windows mostly: 4 GiB at
+//! most with the default 1023). When none is left a page without a copy
+//! stays without: its accesses are lost, which for the structure builder
+//! is a dropped stage, so from then on its dispatches are refused and the
+//! builder is turned off (run of 2026-11-26 00:29 with
+//! `VICTORY_BVH_BUILDER=1`: the numbers ran out 0.8 s into the first
+//! builder frame, and when that frame's results landed thirteen title
+//! threads died at once on pointers that had become bounding-box bit
+//! patterns, `0x7f8000007f800000` and `0xfc007c00fc007c00`).
+//!
+//! `VICTORY_MEMORY_TRACE=1` logs what numbers copies: each of the first
+//! copies with the address and what named it (a root view, a pair of
+//! constants, a constant in 256-byte units, the 4 MiB after one of those,
+//! a fault), and a line per frame with the counts. Every dispatch of such a shader brings all numbered copies up to
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
@@ -55,8 +67,41 @@ use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+/// listed frame of the opening cutscene names about 50 windows; the first
+/// frame of the structure builder in the world named more than 1023.
+/// `VICTORY_MEMORY_COPIES=<n>` sets it (each numbered copy is kept, and
+/// brought up to date by every list that runs such a shader).
+fn copies() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_COPIES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .map_or(1023, |n| n.min(1 << 16))
+    })
+}
+
+/// `VICTORY_MEMORY_TRACE=1`: see the module.
+fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_TRACE").is_some_and(|v| v == "1"))
+}
+
+/// What named an address whose page got a copy.
+#[derive(Clone, Copy, Debug)]
+enum Route {
+    /// A root view of the dispatch.
+    View,
+    /// Two root constants: the low dword, then bits 32 to 39.
+    Pair,
+    /// One root constant in 256-byte units.
+    Units,
+    /// The 4 MiB after an address named one of the ways above.
+    After,
+    /// A page a shader found without a copy.
+    Fault,
+}
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -75,6 +120,13 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// No copy number was left for a page that needed one: its accesses
+    /// are lost from then on.
+    full: bool,
+    /// Copies numbered since the last frame, by [`Route`]; and how many
+    /// were logged one by one so far (`VICTORY_MEMORY_TRACE=1`).
+    numbered: [u32; 5],
+    traced: u32,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -111,12 +163,15 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            full: false,
+            numbered: [0; 5],
+            traced: 0,
         })
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
     /// is the title's.
-    fn map(&mut self, address: u64) {
+    fn map(&mut self, address: u64, route: Route) {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
@@ -154,9 +209,22 @@ impl Memory {
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
+            None if self.copies.len() < copies() as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
+                self.numbered[route as usize] += 1;
+                if trace() && self.traced < 400 {
+                    self.traced += 1;
+                    let (first, len) = shadow.span();
+                    tracing::info!(
+                        number = n + 1,
+                        address = format_args!("{address:#x}"),
+                        ?route,
+                        copy = format_args!("{first:#x}+{len:#x}"),
+                        frame = crate::frame::current(),
+                        "title memory by address: a copy numbered (VICTORY_MEMORY_TRACE=1)"
+                    );
+                }
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -178,9 +246,15 @@ impl Memory {
                 n
             }
             None => {
+                self.full = true;
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    tracing::warn!(
+                        copies = copies(),
+                        address = format_args!("{address:#x}"),
+                        ?route,
+                        "title memory by address: no number left for another copy; its pages read zeros and stores to them are dropped, so the structure builder's stages are refused from here on (VICTORY_MEMORY_COPIES sets the count)"
+                    )
                 });
                 return;
             }
@@ -221,15 +295,15 @@ impl Memory {
             }
         }
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            self.map(u64::from(page) * PAGE, Route::Fault);
         }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+    fn name(&mut self, address: u64, route: Route) {
+        self.map(address, route);
+        self.map((address & !(CELL - 1)) + CELL, Route::After);
     }
 }
 
@@ -238,13 +312,17 @@ impl Memory {
 /// `constants`: its root constants, see the module), every numbered copy
 /// has its view in `heap`'s run and is brought up to date when `list` is
 /// submitted (and, with `writes`, copied back after). None if the host
-/// cannot hold it; the draw is then dropped.
+/// cannot hold it, or if it is a stage of the structure builder (`builder`)
+/// and copy numbers have run out (its accesses to pages without a copy
+/// would be lost); the draw is then dropped, and a dropped builder stage
+/// turns the builder off.
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
     addresses: &[u64],
     constants: &[u32],
     writes: bool,
+    builder: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -256,10 +334,25 @@ pub(crate) fn ready(
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
+        if trace() && m.numbered.iter().any(|&n| n > 0) {
+            let [view, pair, units, after, fault] = m.numbered;
+            tracing::info!(
+                frame,
+                view,
+                pair,
+                units,
+                after,
+                fault,
+                total = m.copies.len(),
+                of = copies(),
+                "title memory by address: copies numbered since the last frame line, by what named them (VICTORY_MEMORY_TRACE=1)"
+            );
+        }
+        m.numbered = [0; 5];
     }
     let numbered = m.copies.len();
     for &address in addresses {
-        m.name(address);
+        m.name(address, Route::View);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -269,18 +362,28 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            m.name(u64::from(c) | u64::from(high) << 32, Route::Pair);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            m.name(u64::from(c) << 8, Route::Units);
         }
+    }
+    if builder && m.full {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                numbered = m.copies.len(),
+                "title memory by address: a stage of the structure builder is refused, no copy number is left for the pages it may reach"
+            )
+        });
+        return None;
     }
     let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let base = heap.dynamic(copies() + 1)?;
             heap.null_raw_uav_at(base);
             (base, 0)
         }

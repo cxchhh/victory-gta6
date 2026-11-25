@@ -974,7 +974,7 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool, builder: bool) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -987,7 +987,7 @@ impl State {
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        crate::memory::ready(list, heap, &addresses, &constants, writes, builder)
     }
 
     /// The bound heap holding `handle`.
@@ -1170,11 +1170,17 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            // Title memory by address: what the shader finds it by.
+            // Title memory by address: what the shader finds it by. Its
+            // numbered copies are declared written only for a shader that
+            // stores by address: one that walks ray-tracing structures and
+            // stores through its views would have every copy compared
+            // (gigabytes) and would carry the builder's stores back past
+            // `VICTORY_BVH_QUARANTINE=1` when it shares their submission.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
-                    once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return not_bound("title memory by address without a view heap", "");
+                let builder = crate::pipeline::is_builder(self.pipeline as This);
+                let Some(ready) = self.memory_ready(list, compute, writes && t.raw_stores, builder) else {
+                    once!("a shader that reads title memory by address without a view heap to hold its views, or a stage of the structure builder after title memory by address ran out of copy numbers: the draw is dropped");
+                    return not_bound("title memory by address without a view heap, or out of copy numbers", "");
                 };
                 Some(ready)
             } else {
@@ -3134,7 +3140,26 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    ///
+    /// An indirect dispatch of the structure builder that is dropped while
+    /// the builder runs is a dropped stage: the builder is turned off, as
+    /// for a direct dispatch that cannot be bound (its later stages would
+    /// compute store offsets from what this one never wrote).
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        shape: (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        let ran = self.execute_indirect_inner(list, shape, arguments, count);
+        if !ran && crate::pipeline::is_builder(self.pipeline as This) && crate::pipeline::builder_whole() {
+            crate::pipeline::builder_off("one of its indirect dispatches was dropped");
+        }
+        ran
+    }
+
+    fn execute_indirect_inner(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
