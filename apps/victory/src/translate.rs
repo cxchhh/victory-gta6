@@ -552,6 +552,13 @@ fn check(
             &shader.dxil,
         );
     }
+    // `VICTORY_PHI_CENSUS`: programs whose module has self-referring phis.
+    if std::env::var_os("VICTORY_PHI_CENSUS").is_some() {
+        let n = victory_shader::emit::last_self_phis();
+        if n > 0 {
+            eprintln!("selfphis {n} {}", label());
+        }
+    }
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),

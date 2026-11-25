@@ -234,6 +234,23 @@ impl Module {
         }
     }
 
+    /// Diagnostics: the phis that take their own value on some edge (a
+    /// register a loop leaves alone, joined at a header entered from
+    /// several blocks). Drivers' converters are not all ready for them.
+    pub(crate) fn self_phis(&self) -> usize {
+        let mut n = 0;
+        for b in &self.blocks {
+            for &p in &b.phis {
+                if let Op::Phi(incoming) = &self.insts[p as usize].op
+                    && incoming.iter().any(|&(v, _)| v == V::Inst(p))
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// Per function: what a call of it does.
     pub(super) fn effects(&self) -> Vec<Effect> {
         self.funcs.iter().map(effect).collect()

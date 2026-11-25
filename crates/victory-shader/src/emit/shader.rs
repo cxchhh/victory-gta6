@@ -495,6 +495,7 @@ impl Shader {
         let passes = super::shader_opt() & super::bitcode::opt::MODULE;
         if passes != 0 {
             self.m.optimise(passes);
+            LAST_SELF_PHIS.with(|c| c.set(self.m.self_phis()));
             let used = self.m.usage();
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
@@ -1008,4 +1009,14 @@ mod tests {
         assert_eq!(elems[2].interp, 3);
         assert_eq!(elems[3].interp, 3);
     }
+}
+
+thread_local! {
+    static LAST_SELF_PHIS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Diagnostics: the self-referring phis of the last shader this thread
+/// finished (see `bitcode::Module::self_phis`).
+pub fn last_self_phis() -> usize {
+    LAST_SELF_PHIS.with(std::cell::Cell::get)
 }
