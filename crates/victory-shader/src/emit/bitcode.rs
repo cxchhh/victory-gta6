@@ -518,6 +518,28 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Moves the phis and code of `block`, which has no terminator yet, to a new block that
+    /// the branches already made to `block` now go to, and returns it. `block` is left
+    /// empty: code put between the two runs before what is added to `block` later. Not the
+    /// entry block.
+    pub fn split_before(&mut self, block: usize) -> usize {
+        assert!(block != 0 && self.blocks[block].term.is_none(), "split of the entry or a finished block");
+        let pre = self.new_block();
+        let phis = std::mem::take(&mut self.blocks[block].phis);
+        let body = std::mem::take(&mut self.blocks[block].body);
+        self.blocks[pre].phis = phis;
+        self.blocks[pre].body = body;
+        let to = |t: usize| if t == block { pre } else { t };
+        for b in &mut self.blocks {
+            b.term = match b.term {
+                Some(Term::Br(t)) => Some(Term::Br(to(t))),
+                Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
+                other => other,
+            };
+        }
+        pre
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)

@@ -418,6 +418,63 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     eprintln!("ran on the hardware device ({name}): the OR of both halves in every case");
 }
 
+/// `program()` in a group of 128 threads: two console waves, each taking the branch on its
+/// own. With at most 64 threads below s0 only the first takes it, and a group barrier inside
+/// it would wait for the second forever; the two host waves of each console wave meet only
+/// each other.
+#[test]
+fn two_console_waves_take_a_wave_wide_branch_apart() {
+    let mut native = program(0xBF88_0000);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.threads = [128, 1, 1];
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the branch");
+    let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return;
+        }
+    };
+    // (thread t gives bit (t >> 1) mod 32; with all 128 below s0 both console waves store
+    // the same word)
+    for (below, expected) in [(128u32, u32::MAX), (64, u32::MAX), (40, 0x000F_FFFF), (33, 0x0001_FFFF), (1, 1)] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!(out[0][0], expected, "{below} threads in the branch");
+    }
+    eprintln!("ran on the hardware device: each console wave met only itself");
+}
+
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
 fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
