@@ -27,6 +27,17 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// Title addresses of the buffer views of the view heap by slot, for
+/// console code that reads a descriptor's address out of a table at an
+/// index it computes (ray-tracing structures and the programs that walk
+/// them) and finds no root view to ask the host about. Two dwords per
+/// slot: the title address of the view's first byte. Slots without a
+/// buffer view read zero. Like [`SLOT_STRIDES`], the host readies the
+/// buffer views of the whole heap when a shader has this root SRV.
+pub const SLOT_VIEWS: u8 = 252;
+/// Slots of the [`SLOT_VIEWS`] buffer (heap indices are clamped to it).
+pub const SLOT_VIEWS_COUNT: u32 = SLOT_STRIDES_COUNT;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the
@@ -354,6 +365,7 @@ impl Shader {
 
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
+    /// A handle to the static sampler at `n`.
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
         let bind = [
             self.m.i32(n),
@@ -376,6 +388,36 @@ impl Shader {
         } else {
             0
         };
+        self.annotate(block, h, 14 | cmp, 0)
+    }
+
+    /// A handle to the static sampler at `lo..=hi` picked by `index`: the
+    /// console compiler chooses between two immediate samplers on a branch,
+    /// and D3D12's static sampler registers can be indexed within one range.
+    pub fn sampler_range_handle(&mut self, block: usize, lo: u32, hi: u32, index: V) -> V {
+        let bind = [
+            self.m.i32(lo),
+            self.m.i32(hi),
+            self.m.i32(SAMPLER_SPACE),
+            self.m.i8(3), // sampler
+        ];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        // The index comes from a per-lane branch condition.
+        let f = self.m.bool(true);
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, index, f],
+        );
+        let mut cmp = 0;
+        for n in lo..=hi {
+            if self.cmp_samplers >> n & 1 != 0 {
+                cmp = 0x8000;
+            }
+        }
         self.annotate(block, h, 14 | cmp, 0)
     }
 
@@ -641,6 +683,15 @@ impl Shader {
         }
 
         let graphics = self.threads.is_none() || self.mesh.is_some();
+        // DXIL requires every signature element packed into the same row to
+        // share one interpolation mode. Integer / SV_IsFrontFace elements must
+        // stay constant (1); otherwise a read element's mode wins over unread
+        // siblings in the same row.
+        if self.pixel {
+            reconcile_row_interp(&mut self.inputs);
+        } else if graphics {
+            reconcile_row_interp(&mut self.outputs);
+        }
         if graphics {
             // shortcut: every output is declared to depend on every input; the
             // exact sets need a dependence pass. Drivers read this state.
@@ -886,5 +937,75 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Ensures elements sharing a signature row declare one DXIL interpolation
+/// mode. Any integer or `SV_IsFrontFace` element forces the row to `constant`
+/// (`1`); otherwise, a used element's mode overrides unread siblings.
+fn reconcile_row_interp(elems: &mut [SigElement]) {
+    let mut row_mode: std::collections::HashMap<u32, (bool, Option<u8>)> =
+        std::collections::HashMap::new();
+    for e in elems.iter() {
+        let Some(row) = e.row else { continue };
+        if e.interp == 0 {
+            continue;
+        }
+        let entry = row_mode.entry(row).or_insert((false, None));
+        if e.kind == 13 || e.comp != 9 {
+            entry.0 = true;
+        } else if e.usage != 0 && entry.1.is_none() {
+            entry.1 = Some(e.interp);
+        }
+    }
+    for e in elems.iter_mut() {
+        let Some(row) = e.row else { continue };
+        if e.interp == 0 {
+            continue;
+        }
+        if let Some(&(force_const, used_mode)) = row_mode.get(&row) {
+            if force_const {
+                e.interp = 1;
+            } else if e.usage == 0
+                && let Some(m) = used_mode
+            {
+                e.interp = m;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elem(name: &str, kind: u8, comp: u8, interp: u8, row: u32, col: u8, usage: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn reconcile_row_interp_matches_constant_and_used_siblings() {
+        let mut elems = vec![
+            elem("TEXCOORD", 0, 9, 2, 7, 0, 0),
+            elem("SV_IsFrontFace", 13, 5, 1, 7, 1, 1),
+            elem("TEXCOORD", 0, 9, 2, 8, 0, 0),
+            elem("TEXCOORD", 0, 9, 3, 8, 1, 1),
+        ];
+        reconcile_row_interp(&mut elems);
+        assert_eq!(elems[0].interp, 1);
+        assert_eq!(elems[1].interp, 1);
+        assert_eq!(elems[2].interp, 3);
+        assert_eq!(elems[3].interp, 3);
     }
 }

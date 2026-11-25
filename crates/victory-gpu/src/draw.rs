@@ -1057,6 +1057,23 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEWS {
+                        // Ours: the title addresses of the heap's buffer
+                        // views, for a descriptor read as data.
+                        match self.heap_views(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads view addresses of a heap that is not set"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -1499,6 +1516,26 @@ impl State {
         Some(gpu)
     }
 
+    /// [`State::heap_buffers`] for a shader that reads a descriptor's
+    /// address as data: the GPU address of the host's table of the buffer
+    /// views' title addresses by heap slot. The pass that readies the
+    /// buffer views also fills the table.
+    fn heap_views(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.views_gpu()?;
+        self.heap_buffers(list)?;
+        if let Some(buffer) = host.views_buffer() {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     /// Runs the pass that uploads textures picked by index
     /// ([`State::heap_textures`]) where nothing has asked for it yet
     /// ([`early_budgets`]): once a frame for a few milliseconds, at the
@@ -1744,6 +1781,10 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        // Bytes of textures uploaded in this pass so far: used to gate
+        // giant textures under a budget (one alone is allowed when nothing
+        // else has been done yet, to avoid starvation).
+        let mut done_bytes: u64 = 0;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
@@ -1858,6 +1899,24 @@ impl State {
                     );
                 }
             }
+            // Under a budget (early or bake pass): recheck time before the
+            // heavy work of making and staging a texture, and cap each
+            // texture at 64 MiB so one giant upload cannot alone blow the
+            // watchdog. One giant texture is still allowed when nothing
+            // else has been done yet, to avoid starvation of textures that
+            // are always large.
+            const PER_TEXTURE_BUDGET: u64 = 64 << 20;
+            if PASS_BUDGET.get().is_some() {
+                if began.elapsed() > span {
+                    break;
+                }
+                if done_bytes > 0
+                    && SPENT.load(Ordering::Relaxed).saturating_add(PER_TEXTURE_BUDGET)
+                        > bytes_at_most
+                {
+                    break;
+                }
+            }
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
@@ -1924,6 +1983,7 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            done_bytes = done_bytes.saturating_add(bytes);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {
