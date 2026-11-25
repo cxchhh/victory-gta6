@@ -13,8 +13,8 @@
 //! -9.75). The title's own lighting then applies it with the surfaces'
 //! colors. Raised, not added: the result is the next frame's history.
 //!
-//! `VICTORY_AMBIENT=<level>` sets it (0.2 by default, 0 for none); `off`
-//! keeps the title's own output; `VICTORY_AMBIENT_FILE` changes it while
+//! Off by default: the title's own output. `VICTORY_AMBIENT=<level>` sets
+//! it (0 for no indirect diffuse light at all), `off` keeps the title's; `VICTORY_AMBIENT_FILE` changes it while
 //! the title runs ([`level`]).
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
 
@@ -32,10 +32,11 @@ pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 
-/// 0.6 looked balanced in Belobug's run a2, but in the prison cell (run
-/// vx2, 2026-11-25) it washed out the sun's contrast, the shadows and the
-/// materials: the same light from everywhere on every surface.
-const DEFAULT: f32 = 0.2;
+/// Off: the title's own light. 0.6 looked balanced in Belobug's run a2,
+/// but in the prison cell (run vx2, 2026-11-25) it washed out the sun's
+/// contrast, the shadows and the materials (the same light from
+/// everywhere on every surface); set a level to compare.
+const DEFAULT: f32 = -1.0;
 
 /// A level as set: a number, or `off` (negative).
 fn parse(set: &str) -> Option<f32> {
