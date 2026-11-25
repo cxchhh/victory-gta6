@@ -456,9 +456,25 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        use windows::core::Interface;
+        // An empty library is asked for with a null blob: an empty slice's
+        // pointer is not null, and vkd3d-proton takes any non-null pointer
+        // for a blob to parse and refuses it, so under Wine no library was
+        // ever kept between runs.
+        let blob = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+        let mut out = std::ptr::null_mut();
+        // SAFETY: the bytes outlive the library (kept beside it); `out` is
+        // an owned interface pointer on success.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                Interface::as_raw(device),
+                blob,
+                bytes.len(),
+                &ID3D12PipelineLibrary::IID,
+                &mut out,
+            )
+            .ok()?;
+            ID3D12PipelineLibrary::from_raw(out).cast()
         }
     };
     if !blob.bytes().is_empty() {

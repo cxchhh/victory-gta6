@@ -6616,6 +6616,7 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
+        #[cfg(feature = "diagnostics")]
         if crate::gdi::on() {
             return self.present_gdi(texture, state, frame, width, height);
         }
@@ -6735,6 +6736,7 @@ impl Host {
 
     /// [`Self::present`] with `VICTORY_GDI_PRESENT` ([`crate::gdi`]): no
     /// swap chain; the frame is read back and drawn into the window.
+    #[cfg(feature = "diagnostics")]
     fn present_gdi(&self, texture: &ID3D12Resource, state: u32, frame: u64, width: u32, height: u32) -> Option<bool> {
         struct Gdi(HWND, HostList, Meter);
         // SAFETY: used under the lock only, as the swap chain's presenter is.

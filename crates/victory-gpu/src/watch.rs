@@ -354,7 +354,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
-    let known_view = guarded && known_view(first * PAGE);
+    let known_view = guarded && known_view(first * PAGE, last * PAGE);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
@@ -451,11 +451,13 @@ impl Tracked {
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
-/// Whether the block holding `start` is view memory the guards already
+/// Whether every block of `start..end` is view memory the guards already
 /// hold (read-only by our hand, or noted absent): asking the kernel's write
-/// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
-/// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
-fn known_view(start: usize) -> bool {
+/// watch about it can only fail. A range that runs on past the guarded
+/// view into memory the guards do not hold is asked about, or its writes
+/// there are missed. `VICTORY_VIEW_ASK=1` (or `VICTORY_GUARD_ASK=1`) asks
+/// the kernel anyway, as before.
+fn known_view(start: usize, end: usize) -> bool {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ask = *ASK.get_or_init(|| {
         ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
@@ -466,8 +468,7 @@ fn known_view(start: usize) -> bool {
         return false;
     }
     let g = guards();
-    let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first)
+    (start / BLOCK..end.div_ceil(BLOCK)).all(|b| g.protected.contains(&b) || g.absent.contains(&b))
 }
 
 struct Guards {
