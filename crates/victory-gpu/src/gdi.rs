@@ -7,7 +7,8 @@
 //! window itself, on an X server, can be seen and recorded.
 //! `VICTORY_GDI_PRESENT=<n>` draws every n-th frame only.
 
-use std::sync::OnceLock;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D12::{D3D12_PLACED_SUBRESOURCE_FOOTPRINT, ID3D12Resource};
@@ -15,7 +16,7 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, COLORONCOLOR, DIB_RGB_COLORS, GetDC, ReleaseDC, SRCCOPY,
     SetStretchBltMode, StretchDIBits,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
 /// Every how many frames one is drawn; 0: off.
 fn every() -> u64 {
@@ -32,10 +33,20 @@ pub(crate) fn on() -> bool {
     every() != 0
 }
 
-/// Whether frame `frame` is to be drawn.
+/// Whether frame `frame` is to be drawn: every n-th, at most 15 a second.
 pub(crate) fn wanted(frame: u64) -> bool {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     let n = every();
-    n != 0 && frame.is_multiple_of(n)
+    if n == 0 || !frame.is_multiple_of(n) {
+        return false;
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if last.is_some_and(|t| now.duration_since(t) < Duration::from_millis(66)) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 fn half(h: u16) -> f32 {
@@ -56,68 +67,96 @@ fn srgb8(v: f32) -> u8 {
     (s * 255.0 + 0.5) as u8
 }
 
-/// Rows of the read-back frame as 32-bit BGRA, `width * 4` bytes apart.
-fn to_bgra(format: u32, width: usize, height: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
-    let mut out = vec![0u8; width * height * 4];
-    for y in 0..height {
-        let row = &rows[y * pitch..];
-        let dst = &mut out[y * width * 4..][..width * 4];
-        match format {
-            27..=32 => {
-                for (d, s) in dst.chunks_exact_mut(4).zip(row.chunks_exact(4)) {
-                    d.copy_from_slice(&[s[2], s[1], s[0], 255]);
-                }
-            }
-            87 | 90 | 91 => {
-                for (d, s) in dst.chunks_exact_mut(4).zip(row.chunks_exact(4)) {
-                    d.copy_from_slice(&[s[0], s[1], s[2], 255]);
-                }
-            }
-            23..=25 => {
-                for (d, s) in dst.chunks_exact_mut(4).zip(row.chunks_exact(4)) {
+/// The read-back frame (`width` x `height`, rows `pitch` bytes apart) as
+/// 32-bit BGRA of `dw` x `dh` pixels (nearest sample).
+fn to_bgra(format: u32, [width, height, pitch]: [usize; 3], [dw, dh]: [usize; 2], rows: &[u8]) -> Option<Vec<u8>> {
+    let size = match format {
+        27..=32 | 87 | 90 | 91 | 23..=25 => 4,
+        9..=14 => 8,
+        _ => return None,
+    };
+    let xs: Vec<usize> = (0..dw).map(|x| (x * width / dw).min(width - 1) * size).collect();
+    let mut out = vec![0u8; dw * dh * 4];
+    for y in 0..dh {
+        let row = &rows[(y * height / dh).min(height - 1) * pitch..];
+        let dst = &mut out[y * dw * 4..][..dw * 4];
+        for (d, &x) in dst.chunks_exact_mut(4).zip(&xs) {
+            let s = &row[x..x + size];
+            let px = match format {
+                27..=32 => [s[2], s[1], s[0], 255],
+                87 | 90 | 91 => [s[0], s[1], s[2], 255],
+                23..=25 => {
                     let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
                     let c = |shift: u32| (((v >> shift) & 0x3ff) >> 2) as u8;
-                    d.copy_from_slice(&[c(20), c(10), c(0), 255]);
+                    [c(20), c(10), c(0), 255]
                 }
-            }
-            9..=14 => {
-                for (d, s) in dst.chunks_exact_mut(4).zip(row.chunks_exact(8)) {
+                _ => {
                     let c = |i: usize| srgb8(half(u16::from_le_bytes([s[i], s[i + 1]])));
-                    d.copy_from_slice(&[c(4), c(2), c(0), 255]);
+                    [c(4), c(2), c(0), 255]
                 }
-            }
-            _ => return None,
+            };
+            d.copy_from_slice(&px);
         }
     }
     Some(out)
 }
 
-/// Draws a frame read back by [`crate::capture::read_back`] (the copy has
-/// finished) into `hwnd`, stretched to its client area.
-pub(crate) fn blit(hwnd: HWND, buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT) {
-    let f = footprint.Footprint;
-    let (width, height, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows.
-    let bgra = unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
+/// A read-back frame waiting for the drawing thread: the window, the
+/// format, `[width, height, pitch]` and the rows.
+struct Pending {
+    hwnd: usize,
+    format: u32,
+    dims: [usize; 3],
+    rows: Vec<u8>,
+}
+
+static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+static READY: Condvar = Condvar::new();
+
+/// The thread that draws the newest pending frame (older ones are dropped).
+fn drawer() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new().name("victory-gdi".into()).spawn(|| loop {
+            let frame = {
+                let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(frame) = pending.take() {
+                        break frame;
+                    }
+                    pending = READY.wait(pending).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            draw(&frame);
+        });
+    });
+}
+
+fn draw(frame: &Pending) {
+    let hwnd = HWND(frame.hwnd as *mut _);
+    let [width, height, _] = frame.dims;
+    let mut rect = RECT::default();
+    // SAFETY: plain queries on our window.
+    let (cw, ch) = unsafe {
+        if GetClientRect(hwnd, &mut rect).is_err() {
             return;
         }
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * height);
-        let bgra = to_bgra(f.Format.0 as u32, width, height, pitch, rows);
-        buffer.Unmap(0, None);
-        bgra
+        let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN).max(1), GetSystemMetrics(SM_CYSCREEN).max(1));
+        ((rect.right - rect.left).clamp(1, sw) as usize, (rect.bottom - rect.top).clamp(1, sh) as usize)
     };
-    let Some(bgra) = bgra else {
+    // Keep the aspect ratio inside the visible client area.
+    let (dw, dh) = if cw * height > ch * width { (ch * width / height, ch) } else { (cw, cw * height / width) };
+    let (dw, dh) = (dw.max(1), dh.max(1));
+    let Some(bgra) = to_bgra(frame.format, frame.dims, [dw, dh], &frame.rows) else {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(format = f.Format.0, "GDI present: this format is not drawn"));
+        ONCE.call_once(|| tracing::warn!(format = frame.format, "GDI present: this format is not drawn"));
         return;
     };
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width as i32,
-            biHeight: -(height as i32),
+            biWidth: dw as i32,
+            biHeight: -(dh as i32),
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
@@ -125,14 +164,9 @@ pub(crate) fn blit(hwnd: HWND, buffer: &ID3D12Resource, footprint: &D3D12_PLACED
         },
         ..Default::default()
     };
-    let mut rect = RECT::default();
-    // SAFETY: our window; a DC released below; rows of `width * height`
-    // 32-bit pixels as `info` says.
+    // SAFETY: our window; a DC released below; `dw * dh` 32-bit pixels as
+    // `info` says.
     unsafe {
-        if GetClientRect(hwnd, &mut rect).is_err() {
-            return;
-        }
-        let (cw, ch) = ((rect.right - rect.left).max(1), (rect.bottom - rect.top).max(1));
         let dc = GetDC(Some(hwnd));
         if dc.is_invalid() {
             return;
@@ -142,12 +176,12 @@ pub(crate) fn blit(hwnd: HWND, buffer: &ID3D12Resource, footprint: &D3D12_PLACED
             dc,
             0,
             0,
-            cw,
-            ch,
+            dw as i32,
+            dh as i32,
             0,
             0,
-            width as i32,
-            height as i32,
+            dw as i32,
+            dh as i32,
             Some(bgra.as_ptr().cast()),
             &info,
             DIB_RGB_COLORS,
@@ -155,4 +189,25 @@ pub(crate) fn blit(hwnd: HWND, buffer: &ID3D12Resource, footprint: &D3D12_PLACED
         );
         ReleaseDC(Some(hwnd), dc);
     }
+}
+
+/// Hands a frame read back by [`crate::capture::read_back`] (the copy has
+/// finished) to the drawing thread, which draws it into `hwnd`.
+pub(crate) fn blit(hwnd: HWND, buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT) {
+    let f = footprint.Footprint;
+    let (width, height, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copy finished; the mapping spans the footprint's rows.
+    let rows = unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() {
+            return;
+        }
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * height).to_vec();
+        buffer.Unmap(0, None);
+        rows
+    };
+    drawer();
+    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(Pending { hwnd: hwnd.0 as usize, format: f.Format.0 as u32, dims: [width, height, pitch], rows });
+    READY.notify_one();
 }
