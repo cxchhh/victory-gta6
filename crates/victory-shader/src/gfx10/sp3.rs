@@ -782,3 +782,28 @@ mod tests {
         assert_eq!(addr.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod print_tests {
+    /// `VICTORY_SP3_FILE=<container> VICTORY_SP3_RANGE=<from hex>-<to hex>`:
+    /// prints the native program's instructions in that range (a tool for
+    /// reading a title program; nothing is asserted).
+    #[test]
+    #[ignore]
+    fn print_a_range() {
+        let path = std::env::var("VICTORY_SP3_FILE").expect("VICTORY_SP3_FILE");
+        let range = std::env::var("VICTORY_SP3_RANGE").unwrap_or_else(|_| "0-ffffff".into());
+        let (a, b) = range.split_once('-').unwrap();
+        let (a, b) = (usize::from_str_radix(a, 16).unwrap(), usize::from_str_radix(b, 16).unwrap());
+        let bytes = std::fs::read(path).unwrap();
+        let c = crate::dxbc::Container::parse(&bytes).unwrap();
+        let dxil = c.part(crate::dxbc::FourCC::DXIL).unwrap().data;
+        for p in crate::native_programs(dxil).unwrap() {
+            for i in super::super::decode(&p.code).unwrap() {
+                if (a..b).contains(&i.offset) {
+                    println!("{:#06x}  {}", i.offset, i.text(p.wave64));
+                }
+            }
+        }
+    }
+}

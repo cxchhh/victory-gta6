@@ -867,7 +867,12 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     };
     let sections: Vec<_> = (0..p.blocks.len()).map(|b| super::wave::sections(p, b)).collect();
     let order = crate::ir::reverse_postorder(&p.blocks);
-    let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
+    // A guarded write of a plain value over a wave-dependent one is a mix for the lanes outside
+    // its condition; an instruction of the same block under the same condition reads only the
+    // lanes that took the plain value (`Bool`s are canonical: equal nodes, equal conditions).
+    // By value: the block and the condition of that write.
+    let mut over: HashMap<Value, (usize, Bool)> = HashMap::new();
+    let mut pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
         for &b in &order {
             let block = &p.blocks[b];
             for phi in &block.phis {
@@ -914,7 +919,23 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if name.starts_with("s_cbranch") {
                     continue; // with the block's exit, below
                 }
-                let (k, reserved) = match step(inst, kind, firsts) {
+                // what this instruction reads of such a mix under the same condition: plain
+                let here = st.guards[b][i];
+                let mut lent = Vec::new();
+                for &(_, v) in &inst.reads {
+                    if here.is_some()
+                        && over.get(&v) == here.map(|g| (b, g)).as_ref()
+                        && of(kind, Some(v)) == Wave::Mixed
+                    {
+                        lent.push(v);
+                        put(kind, v, Wave::Plain);
+                    }
+                }
+                let stepped = step(inst, kind, firsts);
+                for v in lent {
+                    put(kind, v, Wave::Mixed);
+                }
+                let (k, reserved) = match stepped {
                     Ok(r) => r,
                     Err(why) if check => return Err((inst.machine.offset, why)),
                     Err(_) => (Wave::Mixed, false),
@@ -947,6 +968,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                         && matches!(of(kind, inst.read(r)), Wave::First | Wave::Total(_) | Wave::Prefix)
                     {
                         kw = Wave::Mixed;
+                        if let Some(g) = st.guards[b][i] {
+                            over.insert(w, (b, g));
+                        }
                     }
                     put(kind, w, kw);
                 }

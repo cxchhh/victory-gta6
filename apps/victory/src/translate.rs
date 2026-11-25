@@ -803,7 +803,10 @@ fn check(
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
             if t.list {
-                t.lines.push(format!("{}  validated", label()));
+                // the wave64 form it took on a 32-lane host, if another than its own
+                let form = victory_shader::emit::chosen_form();
+                let form = if form.is_empty() { String::new() } else { format!("  form: {form}") };
+                t.lines.push(format!("{}  validated{form}", label()));
             }
         }
         Err(text) => {

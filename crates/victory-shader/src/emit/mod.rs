@@ -185,6 +185,20 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+thread_local! {
+    /// The form a wave64 program on a 32-lane host was last emitted in on
+    /// this thread ([`chosen_form`]); empty when it needed no other form.
+    static CHOSEN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The form the last program [`emit`] took on this thread was emitted in,
+/// when a wave64 program needed one on a 32-lane host ("without skips",
+/// "local waves (APPROXIMATE), without early-outs"...); empty otherwise.
+/// For listings: which programs run approximately.
+pub fn chosen_form() -> String {
+    CHOSEN.with(|c| c.borrow().clone())
+}
+
 /// Whether the deep-skips form is kept from this program:
 /// `VICTORY_WAVE_DEEP_SKIPS_NOT=<name part>,...` names programs by a part of
 /// a name their container holds; they take the next form. None by default:
@@ -196,6 +210,24 @@ fn deep_skips_not(c: &Container) -> bool {
     let not = NOT.get_or_init(|| {
         std::env::var("VICTORY_WAVE_DEEP_SKIPS_NOT")
             .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(|n| n.as_bytes().to_vec())
+            .collect()
+    });
+    names_any(c, not)
+}
+
+/// Whether the wave-wide form is kept from this program even with
+/// `VICTORY_WAVE_WIDE=1`: `VICTORY_WAVE_WIDE_NOT=<name part>,...`, by default
+/// the particle light atlas programs (`ptfx_CS_lightAtlas`), which lost the
+/// card in that form (runs 121-124). Set empty, none is kept from it.
+fn wide_not(c: &Container) -> bool {
+    static NOT: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    let not = NOT.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_NOT")
+            .unwrap_or_else(|_| "ptfx_CS_lightAtlas".to_owned())
             .split(',')
             .map(str::trim)
             .filter(|n| !n.is_empty())
@@ -540,6 +572,7 @@ pub fn emit(
     }
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    CHOSEN.with(|c| c.borrow_mut().clear());
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
@@ -557,6 +590,9 @@ pub fn emit(
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+            if matches!(r, Ok((_, wave)) if *wave != Some(64)) {
+                CHOSEN.with(|c| *c.borrow_mut() = what.to_owned());
+            }
             if why {
                 match r {
                     Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
@@ -611,7 +647,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") && !wide_not(c);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -2147,5 +2183,28 @@ mod deep_skips_not_tests {
         assert!(names_any(&c, &[b"_9945271c".to_vec()]));
         assert!(!names_any(&c, &[b"_00000000".to_vec()]));
         assert!(!names_any(&c, &[]));
+    }
+}
+
+#[cfg(test)]
+mod local_debug_tests {
+    /// `VICTORY_DEBUG_CONTAINER=<file>`: the wave-local check of a title
+    /// program on a 32-lane host, with what each failing read is (a tool).
+    #[test]
+    #[ignore]
+    fn why_not_wave_local() {
+        let path = std::env::var("VICTORY_DEBUG_CONTAINER").expect("VICTORY_DEBUG_CONTAINER");
+        let bytes = std::fs::read(path).unwrap();
+        super::lower::TEST_HOST_WAVE.set(Some(32));
+        let c = crate::dxbc::Container::parse(&bytes).unwrap();
+        let dxil = c.part(crate::dxbc::FourCC::DXIL).unwrap().data;
+        for p in crate::native_programs(dxil).unwrap() {
+            let ir = crate::ir::build(&p.patched_code(), p.wave64, p.vgprs).unwrap();
+            for (name, form) in [("as is", Some(ir.clone())), ("without early-outs", crate::ir::without_early_outs(&ir))] {
+                let Some(f) = form else { continue };
+                let st = crate::structure::structure(&f).unwrap();
+                eprintln!("{name}: {:?}", super::lower::wave_local(&f, &st));
+            }
+        }
     }
 }
