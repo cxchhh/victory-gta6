@@ -3484,9 +3484,12 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [unwatched, unknown, no_snapshot, capped] = crate::shadow::merge_settle_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+             {runs:.0} changed runs, {:.2} MB; settles asked for because the memory is not write-watched {unwatched:.1}, \
+             the journal could not say what was written {unknown:.1}, no snapshot {no_snapshot:.1}, the cap of changed runs \
+             (VICTORY_MERGE_RUNS) {capped:.1}",
             bytes / (1 << 20) as f64
         );
     }
