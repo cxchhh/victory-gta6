@@ -26,6 +26,10 @@ mod trycopy;
 mod ambient;
 #[cfg(windows)]
 mod cardmeter;
+#[cfg(windows)]
+mod texback;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod writewatch;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

@@ -1061,6 +1061,8 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        crate::writewatch::binding(self.pipeline as This);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -3546,6 +3548,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+                if crate::texback::on() {
+                    list.note_texture_back(*resource as This);
+                }
             }
         }
         _ => {}

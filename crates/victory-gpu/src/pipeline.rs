@@ -599,6 +599,15 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The hash of a shader of `this` that is one of `hashes` (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shader_hash_in(this: This, hashes: &[String]) -> Option<String> {
+    if this.is_null() {
+        return None;
+    }
+    pipeline(this).shaders.iter().find(|s| hashes.iter().any(|h| s.hash.starts_with(h.as_str()))).map(|s| s.hash.clone())
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();

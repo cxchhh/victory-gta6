@@ -1950,6 +1950,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Textures bound for unordered access, whose level 0 goes back to
+    /// title memory (`VICTORY_TEXTURE_BACK`, [`crate::texback`]): noted at
+    /// the bind, copied at close, landed after the list ran.
+    texture_noted: Vec<usize>,
+    texture_backs: Vec<crate::texback::Back>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -3624,6 +3629,7 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    crate::texback::land(&list.deferred().texture_backs);
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -5989,6 +5995,9 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        if crate::texback::on() {
+            crate::texback::record(self);
+        }
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
@@ -6449,6 +6458,22 @@ impl HostList {
             crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
             self.pipeline_meter.store(crate::cardmeter::begin_named(&self.list, name).raw(), Ordering::Relaxed);
         }
+    }
+
+    /// A texture bound for unordered access ([`crate::texback`]).
+    pub(crate) fn note_texture_back(&self, resource: crate::object::This) {
+        let mut d = self.deferred();
+        if !d.texture_noted.contains(&(resource as usize)) {
+            d.texture_noted.push(resource as usize);
+        }
+    }
+
+    pub(crate) fn take_texture_backs_noted(&self) -> Vec<usize> {
+        std::mem::take(&mut self.deferred().texture_noted)
+    }
+
+    pub(crate) fn push_texture_back(&self, back: crate::texback::Back) {
+        self.deferred().texture_backs.push(back);
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {

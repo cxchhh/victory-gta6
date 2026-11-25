@@ -2288,6 +2288,8 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
+        #[cfg(feature = "diagnostics")]
+        crate::writewatch::reads(address as usize, len as usize);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
@@ -2346,6 +2348,8 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        #[cfg(feature = "diagnostics")]
+        crate::writewatch::writes(address as usize, len as usize);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
