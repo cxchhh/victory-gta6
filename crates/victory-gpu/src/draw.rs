@@ -70,6 +70,41 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// Diagnostics: why this thread's last `State::prepare_for` or
+    /// `State::bind` answered false (the path, and a detail such as why a
+    /// dynamic descriptor slot was refused), until [`take_not_bound`].
+    #[cfg(feature = "diagnostics")]
+    static NOT_BOUND: std::cell::Cell<(&'static str, &'static str)> = const { std::cell::Cell::new(("", "")) };
+}
+
+/// False, noting why the draw or dispatch is not bound (diagnostics: the
+/// drop reasons name the path that refused it, `take_not_bound`).
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+#[inline]
+fn not_bound(path: &'static str, detail: &'static str) -> bool {
+    #[cfg(feature = "diagnostics")]
+    NOT_BOUND.set((path, detail));
+    false
+}
+
+/// Diagnostics: why the last draw or dispatch prepared on this thread was
+/// not bound ([`not_bound`]), once: "" if nothing said.
+#[cfg(feature = "diagnostics")]
+fn take_not_bound() -> String {
+    match NOT_BOUND.replace(("", "")) {
+        ("", _) => String::new(),
+        (path, "") => path.to_owned(),
+        (path, detail) => format!("{path}: {detail}"),
+    }
+}
+
+/// Why a dynamic descriptor slot was just refused on this thread, for
+/// [`not_bound`] ("" without diagnostics).
+fn slot_refusal() -> &'static str {
+    #[cfg(feature = "diagnostics")]
+    return crate::descriptor::host::last_refusal();
+    #[cfg(not(feature = "diagnostics"))]
+    ""
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -559,6 +594,12 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
     crate::pipeline::note_drop(pipeline as This);
+    // A pipeline the host has, whose draw `prepare_for` refused: why.
+    // (Without a host pipeline `note_drop` said so.)
+    let not_bound = take_not_bound();
+    if !not_bound.is_empty() && crate::pipeline::host_pipeline(pipeline as This).is_some() {
+        crate::pipeline::note_why(format!("draw not bound: {not_bound}"));
+    }
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -968,14 +1009,14 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return not_bound("a skipped pipeline", "");
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return not_bound("no host pipeline", "");
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return not_bound("another kind of pipeline", "");
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -1015,7 +1056,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+                return not_bound("an index buffer outside title buffers", "");
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -1123,7 +1164,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return not_bound("a descriptor table made afresh", slot_refusal());
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -1133,7 +1174,7 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return false;
+                    return not_bound("title memory by address without a view heap", "");
                 };
                 Some(ready)
             } else {
@@ -1341,7 +1382,7 @@ impl State {
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
-                return false;
+                return not_bound("a root UAV with nothing to bind (VICTORY_ROOT_SRV_DIRECT=1)", "");
             };
             ready(a, &s);
             // From the 16 bytes below: the shader adds the rest.
@@ -1364,7 +1405,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root UAV without a bound view heap: the draw is dropped");
-            return false;
+            return not_bound("a root UAV without a bound view heap", "");
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
         let (index, shadow) = match self.root_uav_slots.get(&key) {
@@ -1372,7 +1413,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return not_bound("a root UAV's one-view table", slot_refusal());
                 };
                 self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
@@ -1430,7 +1471,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
+            return not_bound("a root SRV without a bound view heap", "");
         };
         // A view that begins early is another view than one that does not
         // (title addresses stay below bit 63).
@@ -1443,7 +1484,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return not_bound("a root SRV's one-view table", slot_refusal());
                 };
                 self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
@@ -2254,8 +2295,12 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        take_not_bound();
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("dispatch not bound: {}", take_not_bound()));
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3362,6 +3407,8 @@ impl State {
         {
             self.last_indirect = (args.id(), offset);
         }
+        #[cfg(feature = "diagnostics")]
+        take_not_bound();
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -3369,7 +3416,8 @@ impl State {
             _ => false,
         };
         if !ran {
-            why("prepare failed");
+            #[cfg(feature = "diagnostics")]
+            why(&format!("prepare failed: {}", take_not_bound()));
             return false;
         }
         #[cfg(feature = "diagnostics")]
