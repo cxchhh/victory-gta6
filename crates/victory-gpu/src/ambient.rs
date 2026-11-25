@@ -13,8 +13,9 @@
 //! -9.75). The title's own lighting then applies it with the surfaces'
 //! colors. Raised, not added: the result is the next frame's history.
 //!
-//! `VICTORY_AMBIENT=<level>` sets it (0.6 by default, 0 for none); `off`
-//! keeps the title's own output.
+//! `VICTORY_AMBIENT=<level>` sets it (0.2 by default, 0 for none); `off`
+//! keeps the title's own output; `VICTORY_AMBIENT_FILE` changes it while
+//! the title runs ([`level`]).
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
 
 use std::sync::OnceLock;
@@ -31,20 +32,53 @@ pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 
-/// 0.6 looked balanced in run a2. `VICTORY_AMBIENT=off` leaves what the
-/// title's resolve wrote; 0 is no indirect diffuse light at all.
-const DEFAULT: f32 = 0.6;
+/// 0.6 looked balanced in Belobug's run a2, but in the prison cell (run
+/// vx2, 2026-11-25) it washed out the sun's contrast, the shadows and the
+/// materials: the same light from everywhere on every surface.
+const DEFAULT: f32 = 0.2;
 
-/// The floor; `None` if off.
+/// A level as set: a number, or `off` (negative).
+fn parse(set: &str) -> Option<f32> {
+    let set = set.trim();
+    if set == "off" {
+        return Some(-1.0);
+    }
+    set.parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0)
+}
+
+/// The level; `None` if off. `VICTORY_AMBIENT` sets it at the start;
+/// `VICTORY_AMBIENT_FILE=<path>` is read again at most once a second, and
+/// a level in it (`off` or a number) holds from then on: levels compared
+/// in one run, on one frame of the same scene.
 pub(crate) fn level() -> Option<f32> {
-    static LEVEL: OnceLock<f32> = OnceLock::new();
-    let level = *LEVEL.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT").unwrap_or_default();
-        if set.trim() == "off" {
-            return -1.0;
-        }
-        set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0).unwrap_or(DEFAULT)
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LEVEL: AtomicU32 = AtomicU32::new(u32::MAX);
+    static FILE: OnceLock<Option<(std::path::PathBuf, Mutex<(Instant, String)>)>> = OnceLock::new();
+    if LEVEL.load(Ordering::Relaxed) == u32::MAX {
+        let start = std::env::var("VICTORY_AMBIENT").ok().as_deref().and_then(parse).unwrap_or(DEFAULT);
+        LEVEL.store(start.to_bits(), Ordering::Relaxed);
+    }
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_AMBIENT_FILE")?;
+        Some((path.into(), Mutex::new((Instant::now(), String::new()))))
     });
+    if let Some((path, last)) = file
+        && let Ok(mut last) = last.try_lock()
+        && last.0.elapsed() >= Duration::from_secs(1)
+    {
+        last.0 = Instant::now();
+        if let Ok(set) = std::fs::read_to_string(path)
+            && set != last.1
+        {
+            if let Some(l) = parse(&set) {
+                LEVEL.store(l.to_bits(), Ordering::Relaxed);
+                tracing::info!(level = l, "ambient light level from VICTORY_AMBIENT_FILE (negative: off)");
+            }
+            last.1 = set;
+        }
+    }
+    let level = f32::from_bits(LEVEL.load(Ordering::Relaxed));
     (level >= 0.0).then_some(level)
 }
 
@@ -244,5 +278,13 @@ mod tests {
             return;
         };
         super::make(&host.device).expect("the ambient pass");
+    }
+
+    #[test]
+    fn levels_parse() {
+        assert_eq!(super::parse(" 0.25\n"), Some(0.25));
+        assert_eq!(super::parse("off"), Some(-1.0));
+        assert_eq!(super::parse("-2"), None);
+        assert_eq!(super::parse("bright"), None);
     }
 }
