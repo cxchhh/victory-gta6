@@ -1198,12 +1198,34 @@ mod host {
         }
     }
 
+    /// The virtual key a scripted key names: a letter, a digit, or `Enter`,
+    /// `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's
+    /// table maps them to buttons, W/A/S/D to the left stick).
+    #[cfg(feature = "diagnostics")]
+    fn scripted_vk(key: &str) -> Option<u8> {
+        Some(match key.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        })
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[:<hold seconds>],...`
     /// holds each key for 0.2 s (or the hold given) that long after input
     /// starts, with or without focus. A long hold is for titles running far
-    /// below their frame rate, which read the pad seconds apart. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// below their frame rate, which read the pad seconds apart.
+    ///
+    /// `VICTORY_KEY_FILE=<path>`: keys on request while the title runs.
+    /// Whenever that file appears (looked for at most four times a second),
+    /// its `<key>[:<hold seconds>],...` are held from then on and the file
+    /// is removed.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
@@ -1215,34 +1237,44 @@ mod host {
                     .next()
                     .and_then(|h| Duration::try_from_secs_f64(h.trim().parse().ok()?).ok())
                     .unwrap_or(Duration::from_millis(200));
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    hold,
-                    vk,
-                ))
+                Some((Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?, hold, scripted_vk(key)?))
             });
             (Instant::now(), keys.collect())
         });
+        static FILE: LazyLock<Option<std::path::PathBuf>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEY_FILE").map(Into::into));
+        // Keys asked for through the file: until when each is held.
+        static LIVE: std::sync::Mutex<(Option<Instant>, Vec<(Instant, u8)>)> = std::sync::Mutex::new((None, Vec::new()));
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, hold, _)| (at..at + hold).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect()
+            .collect();
+        if let Some(file) = FILE.as_ref() {
+            let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            let instant = Instant::now();
+            if live.0.is_none_or(|t| instant.duration_since(t) >= Duration::from_millis(250)) {
+                live.0 = Some(instant);
+                if let Ok(text) = std::fs::read_to_string(file) {
+                    let _ = std::fs::remove_file(file);
+                    for entry in text.split([',', '\n']) {
+                        let mut parts = entry.split(':');
+                        let Some(vk) = parts.next().and_then(scripted_vk) else { continue };
+                        let hold = parts
+                            .next()
+                            .and_then(|h| Duration::try_from_secs_f64(h.trim().parse().ok()?).ok())
+                            .unwrap_or(Duration::from_millis(200));
+                        tracing::info!(key = entry.trim(), "a key asked for through VICTORY_KEY_FILE");
+                        live.1.push((instant + hold, vk));
+                    }
+                }
+            }
+            live.1.retain(|&(until, _)| until > instant);
+            down.extend(live.1.iter().map(|&(_, vk)| vk).filter(|vk| !down.contains(vk)).collect::<Vec<_>>());
+        }
+        down
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
