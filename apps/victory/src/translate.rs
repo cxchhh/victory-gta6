@@ -69,6 +69,25 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Geometry programs (the GS half of a merged ES+GS stage), those whose
+    /// resources were traced and whose I/O was raised, and those emission
+    /// stopped at [`emit::GS_EMIT`]: counted here, not among `failed`.
+    gs_programs: usize,
+    gs_tracked: usize,
+    gs_raised: usize,
+    /// Geometry programs whose emitted vertices are bounded in the code, and
+    /// the largest bound ([`victory_shader::merged::limits`]).
+    gs_bounded: usize,
+    gs_max_vertices: u32,
+    gs_stopped: usize,
+    /// ES programs (the vertex half of a merged stage): those whose resources
+    /// were traced and I/O raised, and those that write a record for the GS
+    /// half ([`victory_shader::handoff::es_record`]) with the largest record.
+    es_programs: usize,
+    es_tracked: usize,
+    es_raised: usize,
+    es_records: usize,
+    es_max_dwords: u32,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -130,6 +149,17 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.gs_programs += other.gs_programs;
+        self.gs_tracked += other.gs_tracked;
+        self.gs_raised += other.gs_raised;
+        self.gs_bounded += other.gs_bounded;
+        self.gs_max_vertices = self.gs_max_vertices.max(other.gs_max_vertices);
+        self.gs_stopped += other.gs_stopped;
+        self.es_programs += other.es_programs;
+        self.es_tracked += other.es_tracked;
+        self.es_raised += other.es_raised;
+        self.es_records += other.es_records;
+        self.es_max_dwords = self.es_max_dwords.max(other.es_max_dwords);
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -150,6 +180,87 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+}
+
+/// `translate --warm <file>`: the containers whose hash the file names are
+/// translated into the run's shader cache, on `jobs` threads; nothing is
+/// made on the GPU. A run of the title then finds them there instead of
+/// translating each at its first use.
+pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+    // `--warm all`: every container found, whatever its hash.
+    let all = file.as_os_str() == "all";
+    let mut wanted: HashSet<String> = HashSet::new();
+    if !all {
+        let text = std::fs::read_to_string(file)?;
+        for line in text.lines() {
+            for word in line.split(|c: char| !c.is_ascii_hexdigit()) {
+                if word.len() == 16 {
+                    wanted.insert(word.to_ascii_lowercase());
+                }
+            }
+        }
+        anyhow::ensure!(!wanted.is_empty(), "no 16-digit shader hash in {}", file.display());
+    }
+    // `VICTORY_WARM_SECONDS=<n>`: stop taking new shaders after n seconds
+    // (what is done stays in the cache; the next warm-up goes on from there).
+    let limit = std::env::var("VICTORY_WARM_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let paths = crate::default_paths(paths)?;
+    let threads = jobs.unwrap_or(4).max(1);
+    let began = std::time::Instant::now();
+    let done = Mutex::new(HashSet::new());
+    let counts = [const { AtomicUsize::new(0) }; 5];
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(jobs.len()) {
+                    s.spawn(|| {
+                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let Some(bytes) = job.bytes() else {
+                                continue;
+                            };
+                            let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                            if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
+                                counts[3].fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
+                                continue;
+                            }
+                            let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_multiple_of(1000) {
+                                println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
+                            }
+                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
+                                Ok(true) => 0,
+                                Ok(false) => 1,
+                                Err(_) => 2,
+                            };
+                            counts[which].fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+        }
+    }
+    let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
+    let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
+    let stopped = if counts[3].load(Ordering::Relaxed) > 0 { " (stopped at the time limit)" } else { "" };
+    println!(
+        "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads{stopped}",
+        translated + there + failed,
+        began.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 pub fn run(
@@ -274,6 +385,16 @@ pub fn run(
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
+    );
+    println!(
+        "geometry     {} programs: {} resources traced, {} I/O raised, {} stopped at {} \
+         (emitted with the ES half it is linked with, which is in another \
+         container; not among the failures below)",
+        t.gs_programs,
+        t.gs_tracked,
+        t.gs_raised,
+        t.gs_stopped,
+        emit::GS_EMIT
     );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
@@ -434,8 +555,35 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                let geometry = p.stage == HwStage::Gs;
+                let es = p.stage == HwStage::Es;
+                t.gs_programs += usize::from(geometry);
+                t.es_programs += usize::from(es);
+                if es {
+                    match victory_shader::handoff::es_record(&program) {
+                        Ok(r) => {
+                            t.es_records += 1;
+                            t.es_max_dwords = t.es_max_dwords.max(r.dwords);
+                        }
+                        // (an ES half is not emitted alone: this is where it fails)
+                        Err(ShaderError::Unsupported { what, .. }) => {
+                            t.fail(format!("ES record: {what}"), || format!("{} {:?}", example(), p.stage));
+                        }
+                        Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
+                    }
+                }
+                if geometry && let Ok(l) = victory_shader::merged::limits(&program) {
+                    t.gs_bounded += 1;
+                    t.gs_max_vertices = t.gs_max_vertices.max(l.max_vertices);
+                }
+                // (the ES half each geometry program pairs with is not in
+                // its container: its user data 0 and 1 are taken as free, which
+                // the geometry line says)
+                let track = if geometry || es { resource::track_merged } else { resource::track };
+                let res = match track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
+                        t.gs_tracked += usize::from(geometry);
+                        t.es_tracked += usize::from(es);
                         tally_resources(&p, &r, t);
                         Some(r)
                     }
@@ -453,13 +601,15 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || p.stage == HwStage::Ms || geometry || es {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
                             if graphics {
                                 tally_io(&r, t);
                             }
+                            t.gs_raised += usize::from(geometry);
+                            t.es_raised += usize::from(es);
                             raised = Some(r);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
@@ -486,6 +636,24 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 };
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
+                    if es {
+                        // Translated with its GS half (`emit::merged_halves`), not alone.
+                        continue;
+                    }
+                    if geometry {
+                        // A geometry program is emitted with its ES half
+                        // (`emit::translate_merged_gs`), which is in another
+                        // container: counted on its own line, anything else
+                        // it fails with is a failure.
+                        match emit::emit(container, &p, &program, &s, &i, &r) {
+                            Err(ShaderError::Unsupported { what, .. }) if what == emit::GS_EMIT => {
+                                t.gs_stopped += 1;
+                            }
+                            Err(e) => t.fail(format!("emit: {e}"), label),
+                            Ok(_) => unreachable!("geometry emission is refused"),
+                        }
+                        continue;
+                    }
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
@@ -726,6 +894,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
         // tables are no root parameter.
         if let Some(a) = a
             && a.param != resource::CODE
+            && a.param != resource::RUNTIME_TABLE
             && !matches!(
                 p.layout[a.param].root,
                 RootType::ResourceHeap | RootType::SamplerHeap
