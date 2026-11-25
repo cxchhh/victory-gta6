@@ -5999,6 +5999,9 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
+        if crate::gdi::on() {
+            return self.present_gdi(texture, state, frame, width, height);
+        }
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -6111,6 +6114,52 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
+    }
+
+    /// [`Self::present`] with `VICTORY_GDI_PRESENT` ([`crate::gdi`]): no
+    /// swap chain; the frame is read back and drawn into the window.
+    fn present_gdi(&self, texture: &ID3D12Resource, state: u32, frame: u64, width: u32, height: u32) -> Option<bool> {
+        struct Gdi(HWND, HostList, Meter);
+        // SAFETY: used under the lock only, as the swap chain's presenter is.
+        unsafe impl Send for Gdi {}
+        static GDI: Mutex<Option<Gdi>> = Mutex::new(None);
+        let mut gdi = GDI.lock().unwrap_or_else(|e| e.into_inner());
+        if gdi.is_none() {
+            let hwnd = match title_window() {
+                Some(hwnd) => hwnd,
+                None => match window(width, height) {
+                    Ok(hwnd) => hwnd,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "GDI present: no window");
+                        return None;
+                    }
+                },
+            };
+            let copy = self.new_list().ok()?;
+            copy.close();
+            tracing::info!(width, height, "presenting to a window through GDI (VICTORY_GDI_PRESENT)");
+            *gdi = Some(Gdi(hwnd, copy, Meter::new()));
+        }
+        let Gdi(hwnd, copy, meter) = gdi.as_mut()?;
+        if crate::gdi::wanted(frame) {
+            let state = D3D12_RESOURCE_STATES(state as i32);
+            copy.reset();
+            let list = &copy.list;
+            // SAFETY: our list and a live source texture.
+            let read = unsafe {
+                list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let read = crate::capture::read_back(&self.device, list, texture);
+                list.ResourceBarrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
+                read
+            };
+            copy.close();
+            self.execute(&[copy]);
+            if let Some((buffer, footprint)) = read {
+                crate::gdi::blit(*hwnd, &buffer, &footprint);
+            }
+        }
+        meter.frame(*hwnd);
+        Some(false)
     }
 
     fn presenter(

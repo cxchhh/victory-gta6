@@ -17,6 +17,7 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+mod gdi;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
