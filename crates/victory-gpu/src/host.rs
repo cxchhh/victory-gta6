@@ -701,6 +701,37 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// What a kernel copy of title memory costs against a plain one, on this
+    /// host (under Wine the kernel calls may go to the server).
+    /// Prints only; `cargo test kernel_copy_cost -- --nocapture --ignored`.
+    #[test]
+    #[ignore]
+    fn kernel_copy_cost() {
+        let total = 64usize << 20;
+        let src = vec![7u8; total];
+        let mut dst = vec![0u8; total];
+        for size in [4usize << 10, 16 << 10, 64 << 10, 1 << 20] {
+            let n = (total / size).min(4096);
+            let t = std::time::Instant::now();
+            for k in 0..n {
+                assert!(super::read(src[k * size..].as_ptr(), dst[k * size..].as_mut_ptr(), size));
+            }
+            let read_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+            let t = std::time::Instant::now();
+            for k in 0..n {
+                super::write_mapped(dst[k * size..].as_mut_ptr(), src[k * size..].as_ptr(), size);
+            }
+            let write_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+            let t = std::time::Instant::now();
+            for k in 0..n {
+                // SAFETY: both ranges are ours.
+                unsafe { std::ptr::copy_nonoverlapping(src[k * size..].as_ptr(), dst[k * size..].as_mut_ptr(), size) };
+            }
+            let copy_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+            eprintln!("{:>8} B: ReadProcessMemory {read_us:8.2} us, write_mapped {write_us:8.2} us, memcpy {copy_us:8.2} us ({n} each)", size);
+        }
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -6119,6 +6150,11 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    if crate::trycopy::on() {
+        // SAFETY: the destination is ours; a fault in the source fails the
+        // copy (`crate::trycopy`).
+        return unsafe { crate::trycopy::try_copy(dst, src, len) };
+    }
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
@@ -6157,8 +6193,14 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
+    let fast = crate::trycopy::on();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        if fast {
+            // SAFETY: the source is our mapped host copy; a fault in the
+            // destination fails the copy (`crate::trycopy`).
+            return unsafe { crate::trycopy::try_copy(at as *mut u8, from, n) };
+        }
         let mut done = 0;
         if direct {
             // SAFETY: as below; the kernel checks the destination and

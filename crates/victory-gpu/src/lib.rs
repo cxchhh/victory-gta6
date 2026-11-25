@@ -20,6 +20,8 @@ mod capture;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod gdi;
 mod hlsl;
+#[cfg(windows)]
+mod trycopy;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

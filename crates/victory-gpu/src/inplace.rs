@@ -1242,6 +1242,55 @@ mod tests {
         }
     }
 
+    /// The probe on the host's own card (the default adapter): what
+    /// `VICTORY_INPLACE_PROBE=1` would log in a run, without the title.
+    /// Prints only; `cargo test card_probe -- --nocapture --ignored`.
+    #[test]
+    #[ignore]
+    fn card_probe_in_place() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: device creation on the default adapter.
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            eprintln!("no card");
+            return;
+        }
+        let device = device.unwrap();
+        let probe = probe(&device, &|| None, 64);
+        for line in &probe.lines {
+            eprintln!("card in place probe: {line}");
+        }
+        // What becomes of a placed part when the title frees or guards its
+        // pages under the heap (the reason in place stays off under Wine).
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 8 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE).cast::<u8>();
+            let (start, len) = (base as u64 + K64 as u64, 2 * K64 as u64);
+            let Ok(placed) = place_part(&device, start, len) else {
+                eprintln!("card: a part is not placed");
+                return;
+            };
+            let mut rig = Rig::new(&device).unwrap();
+            fill(start as *mut u8, len as usize, 3);
+            let mut old = 0;
+            let protect = mem::VirtualProtect(start as *const _, K64, mem::PAGE_READONLY, &mut old);
+            eprintln!("card: VirtualProtect of a placed page: {}", protect != 0);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize);
+            eprintln!("card: GPU read with the page guarded: {:?}; device {:?}", got.as_ref().map(|g| same(start as *const u8, g)), device.GetDeviceRemovedReason());
+            mem::VirtualProtect(start as *const _, K64, old, &mut old);
+            let stored = rig.store(&placed.buffer, placed.bias + 16, &[0x5a; 64]);
+            eprintln!("card: GPU write after the guard was lifted: {:?}, lands {}", stored.is_ok(), same((start + 16) as *const u8, &[0x5a; 64]));
+            let free = mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT);
+            eprintln!("card: decommit of a placed page under a live heap: {}", free != 0);
+            drop(placed);
+            eprintln!("card: device after the heap is dropped: {:?}", device.GetDeviceRemovedReason());
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
     /// The census names each kind of memory.
     #[test]
     fn census_tells_private_memory_from_views() {
