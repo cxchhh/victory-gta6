@@ -1066,11 +1066,72 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Diagnostics: the highest title slot of a view heap made in its host
+/// heap so far, and how many title slots that host heap holds (the rest of
+/// it, up to the null slot, is the dynamic ring): how far the title's slots
+/// stay below the split on a host heap capped at 1,000,000 views.
+#[cfg(feature = "diagnostics")]
+static HIGHEST_MIRRORED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "diagnostics")]
+static MIRRORED_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Diagnostics: [`HIGHEST_MIRRORED`] and the title slots its heap holds.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn highest_mirrored() -> (u32, u32) {
+    (
+        HIGHEST_MIRRORED.load(std::sync::atomic::Ordering::Relaxed),
+        MIRRORED_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Diagnostics: the fewest dynamic slots free in any view heap since the
+/// last [`take_fewest_free`] (`u32::MAX`: no table asked for).
+#[cfg(feature = "diagnostics")]
+static FEWEST_FREE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Diagnostics: the fewest dynamic slots free since the last call, if a
+/// table was asked for (the copy statistics line).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_fewest_free() -> Option<u32> {
+    Some(FEWEST_FREE.swap(u32::MAX, std::sync::atomic::Ordering::Relaxed)).filter(|&f| f != u32::MAX)
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// Diagnostics: why this thread's last [`HostHeap::dynamic`] was
+    /// refused ([`last_refusal`]).
+    static REFUSED: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// Diagnostics: why this thread's last dynamic slot request was refused,
+/// for the drop reasons (a ring full of tables, or free slots in runs too
+/// short; by the table's length).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn last_refusal() -> &'static str {
+    REFUSED.get()
+}
+
+#[cfg(feature = "diagnostics")]
+fn refusal(full: bool, n: usize) -> &'static str {
+    match (full, n) {
+        (true, 1) => "no free dynamic slot (ring full), 1 asked",
+        (true, 2..=16) => "no free dynamic slots (ring full), 2-16 asked",
+        (true, 17..=64) => "no free dynamic slots (ring full), 17-64 asked",
+        (true, _) => "no free dynamic slots (ring full), over 64 asked",
+        (false, 1) => "no free dynamic slot (in pieces), 1 asked",
+        (false, 2..=16) => "no run of free dynamic slots (in pieces), 2-16 asked",
+        (false, 17..=64) => "no run of free dynamic slots (in pieces), 17-64 asked",
+        (false, _) => "no run of free dynamic slots (in pieces), over 64 asked",
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
+            #[cfg(feature = "diagnostics")]
+            REFUSED.set("no dynamic slots in a sampler heap, or a table longer than the ring");
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -1091,7 +1152,11 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        // (Not cut at `DYNAMIC` positions: with the cursor past 0 the
+        // search is up to `n - 1` longer than the ring, and the cut left out
+        // exactly the positions that join a run before the cursor to the
+        // one after it.)
+        for at in starts.take(if enough { usize::MAX } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -1114,14 +1179,52 @@ impl HostHeap {
                 use crate::copystat::{C, add};
                 add(C::DynamicRefused, 1);
                 add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+                let free = self.free.load(std::sync::atomic::Ordering::Relaxed);
+                let full = (free as usize) < n;
+                if full {
+                    add(C::DynamicFull, 1);
+                }
+                REFUSED.set(refusal(full, n));
+                FEWEST_FREE.fetch_min(free, std::sync::atomic::Ordering::Relaxed);
+                // One refusal in 256, said with the ring's free runs: a
+                // ring full of tables, or free slots in pieces too short.
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 0 {
+                    let (mut runs, mut longest, mut at_least_n, mut run) = (0u32, 0usize, 0u32, 0usize);
+                    for &t in taken.iter().take(self.dynamic as usize).chain(std::iter::once(&true)) {
+                        if t {
+                            if run > 0 {
+                                runs += 1;
+                                longest = longest.max(run);
+                                at_least_n += u32::from(run >= n);
+                            }
+                            run = 0;
+                        } else {
+                            run += 1;
+                        }
+                    }
+                    tracing::info!(
+                        "a dynamic descriptor table refused (one in 256): {n} slots asked, {free} of {} free in {runs} runs \
+                         (the longest {longest}, {at_least_n} of them long enough), search from {cursor}; tables of {} slots \
+                         or more are refused without a search until slots are given back",
+                        self.dynamic,
+                        self.too_long.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                }
             }
             return None;
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        let free = self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed) - n as u32;
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::DynamicSlots, n as u64);
+            FEWEST_FREE.fetch_min(free, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = free;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -1982,6 +2085,11 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        #[cfg(feature = "diagnostics")]
+        if !self.sampler && index < self.count && HIGHEST_MIRRORED.load(std::sync::atomic::Ordering::Relaxed) < index {
+            HIGHEST_MIRRORED.fetch_max(index, std::sync::atomic::Ordering::Relaxed);
+            MIRRORED_COUNT.store(self.count, std::sync::atomic::Ordering::Relaxed);
+        }
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3652,18 +3760,22 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        // Allocate slots 0..8, advancing cursor to 8.
-        let a = heap.dynamic(8).unwrap();
-        // Allocate slots 8..16, advancing cursor to 16.
-        let b = heap.dynamic(8).unwrap();
-        assert_eq!((a, b), (4, 12));
+        // Every slot taken, the search cursor at dynamic slot 12: the
+        // whole ring but 4, the last 4 (the cursor wraps to 0), then the
+        // first 12 given back and taken again (the cursor at 12).
+        let d = heap.dynamic;
+        let x = heap.dynamic(d - 4).unwrap();
+        let y = heap.dynamic(4).unwrap();
+        assert_eq!((x, y), (4, 4 + d - 4));
+        heap.release(x, 12);
+        assert_eq!(heap.dynamic(12), Some(4));
+        assert_eq!(heap.dynamic(1), None);
 
-        // Release slots 10..14 (crossing cursor at 12).
-        // Before the fix, a request of 4 slots starting search at 12 scanned 12..end then 0..12,
-        // missing the contiguous run at 10..14.
-        heap.release(14, 4);
-        let c = heap.dynamic(4);
-        assert_eq!(c, Some(14));
+        // Dynamic slots 10..14 given back: the only free run lies across
+        // the cursor. The search runs 12..end, then 0..12 + 3; cut at the
+        // ring's length it stopped at 12 and missed the run.
+        heap.release(4 + 10, 4);
+        assert_eq!(heap.dynamic(4), Some(4 + 10));
     }
 }
 
