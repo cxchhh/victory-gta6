@@ -10971,6 +10971,24 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
+                // Both ways back, to two loops' tops (the inner loop's last
+                // block also closes the outer one): the second back edge
+                // gets a latch block of its own that counts the outer
+                // iteration. One block as the latch of two loops made
+                // dxil-spirv's structurizer recurse without end (vkd3d-proton
+                // overflowed every stack it was given on
+                // InstanceCulling:CS_Prop_BatchNoCull, #fdd56d97a806bcca).
+                if back(self, taken) && back(self, not_taken) && taken != not_taken {
+                    let here = self.cur;
+                    let latch = self.s.m.new_block();
+                    self.cur = latch;
+                    let ok = self.count_iteration(not_taken, pred::IULT);
+                    let abort = self.abort_block();
+                    let top = self.block[not_taken].expect("reachable");
+                    self.s.m.terminate(latch, Term::CondBr(ok, top, abort));
+                    self.cur = here;
+                    self.edges.insert((b, not_taken), latch);
+                }
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
@@ -11083,8 +11101,12 @@ impl<'a> Lower<'a> {
             .iter()
             .filter(|&&q| self.block[q].is_some())
             .count();
-        // Back edges stay as they are: the exiting block is the latch.
-        if preds < 2 || self.rpo[to] <= self.rpo[from] {
+        // Back edges stay as they are: the exiting block is the latch (or
+        // the latch block of its own a second back edge got, see `exit`).
+        if self.rpo[to] <= self.rpo[from] {
+            return self.edges.get(&(from, to)).copied().unwrap_or(target);
+        }
+        if preds < 2 {
             return target;
         }
         let e = self.s.m.new_block();
