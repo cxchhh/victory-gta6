@@ -98,7 +98,40 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
     let code = crate::hlsl::compile_compute("ambient light", SOURCE)?;
     // SAFETY: plain object creation from our own compiled code.
     unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
+        let range = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let parameters = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        // The layout `RS` in the source names, serialized by the host: the
+        // system compiler under Wine leaves the attribute out.
+        let signature = crate::root::host_blob(&D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: parameters.len() as u32,
+            pParameters: parameters.as_ptr(),
+            ..Default::default()
+        })
+        .inspect_err(|e| tracing::warn!(error = %e, "ambient light: root signature blob"))?;
+        let root: ID3D12RootSignature = device
+            .CreateRootSignature(0, &signature)
+            .inspect_err(|e| tracing::warn!(error = %e, "ambient light: root signature"))?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -106,7 +139,8 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
                 BytecodeLength: code.len(),
             },
             ..Default::default()
-        })?;
+        })
+        .inspect_err(|e| tracing::warn!(error = %e, "ambient light: pipeline"))?;
         let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         let views = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: kind,

@@ -958,40 +958,46 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
+/// Takes a write to a guarded block (opens it, the write goes on);
+/// `EXCEPTION_CONTINUE_SEARCH` (0) for anything else. Also asked first by
+/// the fast copy's handler (`crate::trycopy`), which may sit ahead of it.
+pub(crate) unsafe extern "system" fn on_write(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    };
+    // SAFETY: the system passes the exception being dispatched.
+    let r = unsafe { &*(*info).ExceptionRecord };
+    const WRITE: usize = 1;
+    if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+        || r.NumberParameters < 2
+        || r.ExceptionInformation[0] != WRITE
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let at = r.ExceptionInformation[1];
+    // Held across both checks: another thread may have opened the block
+    // since this one faulted, and a copy may have guarded it again since
+    // (then it is ours again, not read-only for some other reason).
+    let mut g = guards();
+    if open(&mut g, at, at + 1) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if writable(at) {
+        EXCEPTION_CONTINUE_EXECUTION
+    } else {
+        EXCEPTION_CONTINUE_SEARCH
+    }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
-    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-        EXCEPTION_POINTERS,
-    };
-    unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
-        // SAFETY: the system passes the exception being dispatched.
-        let r = unsafe { &*(*info).ExceptionRecord };
-        const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-        let at = r.ExceptionInformation[1];
-        // Held across both checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
-        if open(&mut g, at, at + 1) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
-        }
-    }
+    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {

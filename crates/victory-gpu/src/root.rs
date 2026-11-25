@@ -78,6 +78,38 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
     })
 }
 
+/// Our own passes' root signatures, serialized by the host as version 1.0:
+/// Wine's `d3dcompiler_47` ignores the `[RootSignature]` attribute, so the
+/// code it compiles carries none.
+#[cfg(windows)]
+pub(crate) fn host_blob(
+    desc: &windows::Win32::Graphics::Direct3D12::D3D12_ROOT_SIGNATURE_DESC,
+) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::core::Interface;
+    type Host = unsafe extern "system" fn(
+        *const windows::Win32::Graphics::Direct3D12::D3D12_ROOT_SIGNATURE_DESC,
+        u32,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> windows::core::HRESULT;
+    static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
+    let address = host_export(&FUNCTION, c"D3D12SerializeRootSignature")
+        .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_NOTIMPL))?;
+    let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: the export has this signature; out pointers are ours, and
+    // what they get is owned here.
+    unsafe {
+        let hr = std::mem::transmute::<usize, Host>(address)(desc, 1, &mut blob, &mut error);
+        if !error.is_null() {
+            drop(ID3DBlob::from_raw(error));
+        }
+        hr.ok()?;
+        let blob = ID3DBlob::from_raw(blob);
+        Ok(std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()).to_vec())
+    }
+}
+
 fn without_console_flags(desc: Desc) -> Desc {
     if desc.flags & CONSOLE_FLAGS != 0 {
         tracing::debug!(

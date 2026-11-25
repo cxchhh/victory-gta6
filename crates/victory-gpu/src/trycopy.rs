@@ -61,6 +61,11 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         if record.ExceptionCode as NTSTATUS == EXCEPTION_ACCESS_VIOLATION
             && context.Rip == victory_try_copy_insn as *const () as usize as u64
         {
+            // A write into a guarded block opens it and goes on.
+            let guarded = crate::watch::on_write(info);
+            if guarded != EXCEPTION_CONTINUE_SEARCH {
+                return guarded;
+            }
             context.Rip = victory_try_copy_fault as *const () as usize as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -69,14 +74,17 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 }
 
 /// Whether the fast copy is on (`VICTORY_FAST_COPY`, default on); the
-/// handler is installed on the first ask, last of all handlers.
+/// handler is installed on the first ask, first of all handlers: behind
+/// the crash reporter's, every failed copy was a first-chance report with
+/// its stack walked (run vx1: 677,000 of them in 12 minutes, the frame's
+/// copies 1.8 s instead of 75 ms). It asks the guards' handler first.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_FAST_COPY").is_none_or(|v| v != "0");
         if on {
             // SAFETY: a handler of static code; never removed.
-            unsafe { AddVectoredExceptionHandler(0, Some(handler)) };
+            unsafe { AddVectoredExceptionHandler(1, Some(handler)) };
         }
         on
     })
@@ -91,6 +99,11 @@ pub(crate) fn on() -> bool {
 /// owner beyond the guards' handler (which runs first).
 pub(crate) unsafe fn try_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     debug_assert!(on());
+    // Nothing is ever mapped in the first 64 KiB (a null pointer, mostly):
+    // no fault for it.
+    if (src as usize) < 1 << 16 || (dst as usize) < 1 << 16 {
+        return false;
+    }
     // SAFETY: forwarded; the routine only copies.
     unsafe { victory_try_copy(dst, src, len) == 0 }
 }
@@ -119,5 +132,31 @@ mod tests {
             assert!(!try_copy(base, src.as_ptr(), 16), "a write into a read-only page");
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
+    }
+
+    /// A failed copy never reaches handlers behind it (the crash
+    /// reporter's first-chance report).
+    #[test]
+    fn a_failed_copy_reaches_no_other_handler() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn reporter(_: *mut EXCEPTION_POINTERS) -> i32 {
+            SEEN.fetch_add(1, Ordering::Relaxed);
+            EXCEPTION_CONTINUE_SEARCH
+        }
+        assert!(on());
+        // SAFETY: a counting handler and an allocation of the test's own.
+        unsafe {
+            let h = AddVectoredExceptionHandler(0, Some(reporter));
+            let base = mem::VirtualAlloc(std::ptr::null(), 1 << 16, mem::MEM_RESERVE, mem::PAGE_READWRITE).cast::<u8>();
+            let mut back = vec![0u8; 4096];
+            for _ in 0..100 {
+                assert!(!try_copy(back.as_mut_ptr(), base, 4096));
+            }
+            assert!(!try_copy(back.as_mut_ptr(), std::ptr::null(), 1));
+            windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler(h);
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+        assert_eq!(SEEN.load(Ordering::Relaxed), 0);
     }
 }

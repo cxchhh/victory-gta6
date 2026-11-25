@@ -6113,7 +6113,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
+        } else if !read_kernel(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
         }
@@ -6126,10 +6126,10 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !read_kernel(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if !read_kernel(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -6149,12 +6149,19 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     if crate::trycopy::on() {
         // SAFETY: the destination is ours; a fault in the source fails the
         // copy (`crate::trycopy`).
         return unsafe { crate::trycopy::try_copy(dst, src, len) };
     }
+    read_kernel(src, dst, len)
+}
+
+/// [`read`] through the kernel, whose failure costs no fault: for the
+/// pieces of a copy that already failed, where holes are expected (a
+/// reserved 64 KiB block is one failed piece, then 16 failed pages).
+fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
@@ -6193,8 +6200,11 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
-    let fast = crate::trycopy::on();
-    let write = |at: usize, n: usize| {
+    let fast_first = crate::trycopy::on();
+    // Only the whole range is tried with the fast copy: in the pieces of
+    // one that failed, holes are expected and the kernel fails them with
+    // no fault.
+    let write = |at: usize, n: usize, fast: bool| {
         let from = src.wrapping_add(at - dst as usize);
         if fast {
             // SAFETY: the source is our mapped host copy; a fault in the
@@ -6202,7 +6212,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             return unsafe { crate::trycopy::try_copy(at as *mut u8, from, n) };
         }
         let mut done = 0;
-        if direct {
+        if direct || fast_first {
             // SAFETY: as below; the kernel checks the destination and
             // writes nothing it cannot (the caller opened its guards:
             // `crate::watch::writing`).
@@ -6214,13 +6224,13 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 || write(dst as usize, len, fast_first) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+        if !write(at, n, false) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                write(at, n, false);
             });
         }
     });
