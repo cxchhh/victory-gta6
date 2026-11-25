@@ -22,6 +22,8 @@ mod gdi;
 mod hlsl;
 #[cfg(windows)]
 mod trycopy;
+#[cfg(windows)]
+mod ambient;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

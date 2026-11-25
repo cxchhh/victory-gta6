@@ -2139,6 +2139,40 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        // The least indirect light after the program that resolves it; the
+        // title's state is set again at its next draw or dispatch.
+        if self.ambient(list, p) {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    /// After a dispatch of `p`: the least indirect light
+    /// ([`crate::ambient`]), if it is the program that resolves that.
+    fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        crate::ambient::level().is_some() && {
+            let Some(t) = stage.shader.translated() else { return false };
+            let (slot, offset) = crate::ambient::LIGHT;
+            let light = t
+                .used
+                .iter()
+                .find(|u| u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset))
+                .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Table(table)) => crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4),
+                    _ => None,
+                });
+            match light {
+                Some(crate::descriptor::View::Unordered(r, ..)) if r != 0 => crate::ambient::raise(list, r as This),
+                _ => {
+                    once!("no ambient light: the resolve's light is not where it was");
+                    false
+                }
+            }
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
