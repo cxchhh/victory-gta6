@@ -299,8 +299,12 @@ fn workers() -> bool {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
+            // The host compiler recurses with the shader's nesting (vkd3d's
+            // dxil-spirv: the ray-traced shadow programs overflow 16 MiB);
+            // reserved, not committed.
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                .stack_size(256 << 20)
                 .spawn(|| {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.

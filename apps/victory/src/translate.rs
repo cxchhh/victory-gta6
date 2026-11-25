@@ -223,7 +223,9 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    // A large stack: the host compiler recurses with the
+                    // shader's nesting (as the pipeline workers').
+                    let _ = std::thread::Builder::new().stack_size(256 << 20).spawn_scoped(s, || {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let Some(bytes) = job.bytes() else {
                                 continue;
@@ -314,7 +316,9 @@ pub fn run(
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    // A large stack: the host compiler recurses with the
+                    // shader's nesting (as the pipeline workers').
+                    let _ = std::thread::Builder::new().stack_size(256 << 20).spawn_scoped(s, || {
                         let mut t = Tally {
                             list,
                             ..Tally::default()
@@ -413,6 +417,9 @@ pub fn run(
             };
             println!("pair {v} + {p}: {made}");
         }
+    }
+    if gs_pairs_on() {
+        gs_pairs(threads, validate, dll.as_deref(), pipelines);
     }
     let mut lines = t.lines;
     lines.sort();
@@ -516,6 +523,14 @@ fn translate(
             let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
+    // `VICTORY_TRANSLATE_NAME=<text>|<text>...`: only the containers whose
+    // line holds one of the texts.
+    if let Ok(names) = std::env::var("VICTORY_TRANSLATE_NAME") {
+        let line = example();
+        if !names.split('|').any(|n| !n.is_empty() && line.contains(n)) {
+            return;
+        }
+    }
     if !lock(seen).insert(code) {
         t.duplicates += 1;
         if t.list {
@@ -527,6 +542,15 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `VICTORY_GS_PAIRS=1`: the containers with an ES or a GS program are
+    // kept, to be paired after the run (`gs_pairs`).
+    if gs_pairs_on() {
+        let es = programs.iter().any(|p| p.stage == HwStage::Es);
+        let gs = programs.iter().any(|p| p.stage == HwStage::Gs);
+        if es || gs {
+            lock(&MERGED).push((example(), bytes.to_vec(), gs));
+        }
+    }
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
@@ -983,6 +1007,91 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
                 t.lane_branches += 1;
             }
         }
+    }
+}
+
+/// The containers kept for [`gs_pairs`]: label, bytes, whether it holds the
+/// GS half (else the ES half).
+static MERGED: Mutex<Vec<(String, Vec<u8>, bool)>> = Mutex::new(Vec::new());
+
+fn gs_pairs_on() -> bool {
+    std::env::var_os("VICTORY_GS_PAIRS").is_some_and(|v| v != "0")
+}
+
+/// `VICTORY_GS_PAIRS=1`: each geometry container is paired with the ES
+/// containers whose halves link with it (`emit::merged_halves`), translated
+/// with the first one it translates with (`emit::translate_merged_gs`), the
+/// two host shaders validated and, with `pipelines`, made into a host
+/// pipeline with a pixel stage. The title's own pairs are only known at
+/// run time; this shows what the merged path does on every geometry
+/// program of the pack.
+fn gs_pairs(threads: usize, validate: bool, dll: Option<&Path>, pipelines: bool) {
+    let all = std::mem::take(&mut *lock(&MERGED));
+    let (gs, es): (Vec<_>, Vec<_>) = all.into_iter().partition(|(_, _, g)| *g);
+    println!("gs pairs     {} geometry containers, {} ES containers", gs.len(), es.len());
+    let next = AtomicUsize::new(0);
+    let out: Mutex<Vec<(String, usize, Result<String, String>)>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(gs.len()).max(1) {
+            s.spawn(|| {
+                let mut validator = validate.then(|| Validator::load(dll).ok()).flatten();
+                let host = pipelines.then(|| Host::new(false).ok()).flatten();
+                while let Some((label, g, _)) = gs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let mut linked: Vec<_> = es.iter().filter(|(_, e, _)| emit::merged_halves(e, g).is_ok()).collect();
+                    // The ES container of the same name (`VS_x` for `GS_x`) first.
+                    let stem = |l: &str| l.split(' ').nth(1).map(|n| n.get(3..).unwrap_or(n).to_owned());
+                    let own = stem(label);
+                    linked.sort_by_key(|(l, _, _)| stem(l) != own);
+                    let mut result = Err(if linked.is_empty() { "no ES container links with it".to_owned() } else { String::new() });
+                    for (es_label, e, _) in &linked {
+                        let made = emit::translate_merged_gs(e, g).map_err(|e| format!("translate: {e}")).and_then(|m| {
+                            if let Some(v) = validator.as_mut() {
+                                v.validate(&mut m.vertex.dxil.clone()).map_err(|e| format!("validator (vertex): {}", e.lines().next().unwrap_or("")))?;
+                                v.validate(&mut m.geometry.dxil.clone()).map_err(|e| format!("validator (geometry): {}", e.lines().next().unwrap_or("")))?;
+                            }
+                            let Some(h) = &host else { return Ok("validated".to_owned()) };
+                            let ps = host::stub_ps();
+                            h.pipeline_gs(&m.vertex, &m.geometry, &ps).map_err(|e| format!("pipeline: {e}"))?;
+                            Ok("pipeline created".to_owned())
+                        });
+                        let short = format!(
+                            "{}{}",
+                            es_label.split(' ').nth(1).unwrap_or(es_label),
+                            if stem(es_label) == own { " (same name)" } else { "" }
+                        );
+                        match made {
+                            Ok(what) => {
+                                result = Ok(format!("{what} with {short}"));
+                                break;
+                            }
+                            Err(e) if result.as_ref().is_err_and(String::is_empty) => result = Err(e),
+                            Err(_) => {}
+                        }
+                    }
+                    lock(&out).push((label.clone(), linked.len(), result));
+                }
+            });
+        }
+    });
+    let mut out = out.into_inner().unwrap_or_else(|e| e.into_inner());
+    out.sort();
+    let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+    let mut fine = BTreeMap::<&str, usize>::new();
+    for (label, linked, r) in &out {
+        match r {
+            Ok(what) => {
+                *fine.entry(if what.starts_with("pipeline") { "pipeline created" } else { "validated" }).or_default() += 1;
+                println!("gs {label}  {linked} ES linked; {what}");
+            }
+            Err(e) => {
+                *reasons.entry(e.clone()).or_default() += 1;
+                println!("gs {label}  {linked} ES linked; FAILED {e}");
+            }
+        }
+    }
+    println!("gs pairs     {} geometry programs: {fine:?}", out.len());
+    for (reason, n) in reasons {
+        println!("  {n:>7}  gs pair: {reason}");
     }
 }
 

@@ -302,6 +302,24 @@ impl Host {
         Ok((root, pso))
     }
 
+    /// A graphics pipeline of a vertex, a geometry and a pixel shader, the
+    /// root signature over the three (as the run-time path makes it for a
+    /// merged ES+GS stage).
+    pub fn pipeline_gs(
+        &self,
+        vs: &HostShader,
+        gs: &HostShader,
+        ps: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let root = self.root_signature_for(&[
+            (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (gs, D3D12_SHADER_VISIBILITY_GEOMETRY),
+            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
+        ])?;
+        let pso = self.pipeline_with_gs(&root, &vs.dxil, Some(&gs.dxil), &ps.dxil)?;
+        Ok((root, pso))
+    }
+
     /// A graphics pipeline with the given root signature; vertex inputs
     /// packed in register order.
     pub fn pipeline_with(
