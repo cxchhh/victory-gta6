@@ -371,11 +371,37 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
-        // SAFETY: as above.
-        unsafe { report("first-chance exception", info, false) };
+    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    if FATAL.contains(&code) {
+        // A stack overflow leaves too little stack to format a report: a
+        // fixed line only. And a report that faults itself (on a deep stack
+        // it can overflow) must not report again on the same thread: that
+        // recursed until every worker thread's stack was gone.
+        if code == EXCEPTION_STACK_OVERFLOW {
+            raw_line(b"VIctory: first-chance stack overflow (not reported further)\n");
+        } else if !IN_REPORT.with(|r| r.replace(true)) {
+            // SAFETY: as above.
+            unsafe { report("first-chance exception", info, false) };
+            IN_REPORT.with(|r| r.set(false));
+        }
     }
     EXCEPTION_CONTINUE_SEARCH
+}
+
+thread_local! {
+    /// Whether this thread is inside [`report`] for a first-chance exception.
+    static IN_REPORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Writes `line` to stderr with no formatting and next to no stack.
+fn raw_line(line: &[u8]) {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+    // SAFETY: a plain write of our own bytes to the process's stderr.
+    unsafe {
+        let mut written = 0;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), line.as_ptr(), line.len() as u32, &mut written, null_mut());
+    }
 }
 
 /// For an unhandled-exception filter: reports the exception that is about
