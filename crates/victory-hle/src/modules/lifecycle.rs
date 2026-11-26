@@ -160,6 +160,37 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
     }
+    keys_not_text(hwnd);
+}
+
+/// The keyboard reaches the title as keys, not as text. An input method
+/// (a Chinese or Japanese one, the user's default on this PC) takes letter
+/// keys and Enter for its own composition and pops its candidates over the
+/// window: the title, which reads key states, walks nowhere and its menus
+/// do not go on. So the title's window has no input method, and this
+/// process the US layout; the system's settings and other programs are
+/// left alone. `VICTORY_KEEP_IME=1` keeps what the user has.
+fn keys_not_text(hwnd: HWND) {
+    use windows_sys::Win32::UI::Input::Ime::ImmAssociateContextEx;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        KLF_ACTIVATE, KLF_SETFORPROCESS, LoadKeyboardLayoutW,
+    };
+    if std::env::var_os("VICTORY_KEEP_IME").is_some_and(|v| v == "1") {
+        return;
+    }
+    // SAFETY: a window this thread just created; no input context (0) and
+    // no flags take the window's input method away.
+    let (ime_off, layout) = unsafe {
+        (
+            ImmAssociateContextEx(hwnd, std::ptr::null_mut(), 0) != 0,
+            LoadKeyboardLayoutW(w!("00000409"), KLF_ACTIVATE | KLF_SETFORPROCESS),
+        )
+    };
+    tracing::info!(
+        ime_off,
+        us_layout = !layout.is_null(),
+        "keyboard: the title's window without an input method, US layout for this process (VICTORY_KEEP_IME=1 keeps the user's)"
+    );
 }
 
 extern "system" fn window_proc(

@@ -7575,6 +7575,11 @@ impl HostList {
         self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
     }
 
+    /// Whether the list gathers no more records ([`HostList::gather_close`]).
+    pub(crate) fn gather_is_closed(&self) -> bool {
+        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
+
     /// Shaders of the list were declared to write the host copy numbered
     /// `copy` (`Shadow::gpu_writes`): with
     /// `crate::indirect::gather_by_copy`, no record of that copy is
@@ -10006,8 +10011,30 @@ extern "system" fn window_proc(
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
+/// The keyboard reaches the title as keys, not as text: an input method
+/// (a Chinese or Japanese one, the user's default here) takes letter keys
+/// for its own composition and pops its candidates over the window, and
+/// the title, which reads key states, sees a game that ignores WASD and
+/// Enter. So no input method for this process (before its first window),
+/// and the US layout for it. The system's own settings are left alone.
+/// `VICTORY_KEEP_IME=1` leaves both as the user has them.
+fn english_keyboard() {
+    use windows::Win32::UI::Input::Ime::ImmDisableIME;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{KLF_ACTIVATE, KLF_SETFORPROCESS, LoadKeyboardLayoutW};
+    if std::env::var_os("VICTORY_KEEP_IME").is_some_and(|v| v == "1") {
+        return;
+    }
+    // SAFETY: plain calls; -1 (u32::MAX) is every thread of this process.
+    unsafe {
+        let ime_off = ImmDisableIME(u32::MAX).as_bool();
+        let layout = LoadKeyboardLayoutW(w!("00000409"), windows::Win32::UI::Input::KeyboardAndMouse::ACTIVATE_KEYBOARD_LAYOUT_FLAGS(KLF_ACTIVATE.0 | KLF_SETFORPROCESS.0));
+        tracing::info!(ime_off, us_layout = layout.is_ok(), "keyboard: no input method, US layout for this process (VICTORY_KEEP_IME=1 keeps the user's)");
+    }
+}
+
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     const CLASS: PCWSTR = w!("VIctory");
+    english_keyboard();
     // SAFETY: registers our class once and creates a window of it.
     unsafe {
         let instance = GetModuleHandleW(None)?;

@@ -304,6 +304,14 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 /// part has no wait after its first work).
 #[cfg(windows)]
 fn cut(this: This, wait: ValueWait) {
+    cut_at(this, Some(wait));
+}
+
+/// [`cut`], with the wait the part after it stands at, or none: a cut
+/// where a list stopped gathering indirect records, so that the part
+/// after it gathers again (`crate::draw::gather_cuts`).
+#[cfg(windows)]
+fn cut_at(this: This, wait: Option<ValueWait>) {
     if this.is_null() {
         return;
     }
@@ -314,7 +322,7 @@ fn cut(this: This, wait: ValueWait) {
         return;
     };
     if current.untouched() {
-        list.gate.push(wait);
+        list.gate.extend(wait);
         return;
     }
     let Some(fresh) = fresh_list() else {
@@ -322,16 +330,16 @@ fn cut(this: This, wait: ValueWait) {
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!("no host list for the part after a wait: the wait moves to the part's start"));
-        list.gate.push(wait);
+        list.gate.extend(wait);
         return;
     };
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+    if wait.is_some() && CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
         tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a wait for a memory value");
     }
     if let Some(done) = list.host.replace(fresh) {
-        let waits = std::mem::replace(&mut list.gate, vec![wait]);
+        let waits = std::mem::replace(&mut list.gate, wait.into_iter().collect());
         list.earlier.push(Part { waits, host: done });
     }
     // What the title set so far, on the new host list.
@@ -1728,6 +1736,23 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// With `crate::draw::gather_cuts`: the list is cut before this command if
+/// a record found it no longer gathering (`State::gather_cut`), outside the
+/// draw state's lock, which the cut takes to set the new part up.
+#[cfg(windows)]
+fn gather_cut(this: This) {
+    if this.is_null() || !crate::draw::gather_cuts() || !crate::queue::cuts() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists, recorded by this thread.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    let wanted = std::mem::take(&mut state.lock().unwrap_or_else(|e| e.into_inner()).gather_cut);
+    if wanted {
+        crate::draw::GATHER_CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cut_at(this, None);
+    }
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1760,6 +1785,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        gather_cut(this);
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });

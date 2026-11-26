@@ -225,6 +225,61 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
 }
 
+/// Whether indirect commands run on the title's own records, with no pass
+/// of ours in front (`VICTORY_INDIRECT_TRUST=1`; off by default).
+///
+/// The pass bounds every record before the card reads it, a guard against
+/// garbage written by a pass we drop or translate wrongly. It costs a
+/// compute dispatch and two state changes of its scratch buffer per
+/// command that misses a window: the card goes from drawing to compute and
+/// back each time, in gameplay thousands of times a frame (perf3: 4,500).
+/// The console has no such step. With this the records are the title's,
+/// read where they lie (the argument buffer's copy, promoted to indirect
+/// arguments as a buffer in the common state is), ordered after the
+/// title's argument passes by the title's own barriers, as on the console.
+/// What it gives up: the bound against a record of garbage.
+fn trust_indirect() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_INDIRECT_TRUST").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("indirect commands run on the title's records with no bounding pass of ours (VICTORY_INDIRECT_TRUST=1)");
+        }
+        on
+    }) && !crate::drvwatch::tripped()
+}
+
+/// Diagnostics: indirect commands run on the title's own records
+/// ([`trust_indirect`]) since the last line ([`window_line`]).
+#[cfg(feature = "diagnostics")]
+static TRUSTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a list that stopped gathering is cut so that it gathers again
+/// (`VICTORY_GATHER_CUTS=1`; needs [`gathers`] and the lists cut at their
+/// waits, `crate::queue::cuts`).
+///
+/// A list's prelude clamps the records it gathered before the list runs,
+/// so a list stops gathering at the first thing in it that may write
+/// arguments: in the world the title's compute passes pick the buffers
+/// they write from the view heap, which ends the gathering whole, and
+/// 4,000 records a frame (gather1) then got a pass of ours each, the card
+/// going from drawing to compute and back for every one. With this the
+/// first such record still gets its pass, and the title's next indirect
+/// command cuts the list there, as a wait for a memory value does: the
+/// part before runs as it was recorded, the part after has a prelude of
+/// its own, which runs after the part before (its pass waits for every
+/// earlier shader write first) and clamps every record that part
+/// gathers in one pass. The order of everything on the card stays the
+/// console's.
+pub(crate) fn gather_cuts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GATHER_CUTS").is_some_and(|v| v == "1")) && gathers() && windows()
+}
+
+/// Lists cut so that they gather again ([`gather_cuts`]) since the last
+/// line ([`window_line`]).
+pub(crate) static GATHER_CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether a record that is not on the window's walk opens a window of its
 /// own at once, with the step the title was last seen to walk that
 /// argument buffer by (`VICTORY_WINDOW_JUMP=1`; `alt`: twenty seconds
@@ -347,7 +402,7 @@ pub(crate) fn window_line(frames: f64) {
         "indirect commands per frame by their clamp: {:.0} read from a window (no pass of ours); a pass of ours for {:.0}: {:.0} dispatches, {:.0} of more than one record, {:.0} with a count \
          buffer, {:.0} whose shaders can store to buffers, {:.0} first on their list, {:.0} with no window on their argument buffer, {:.0} off the window's walk, {:.0} past the window's end; \
          {:.0} records clamped by those passes; {:.0} of the passes opened a window at a remembered step (VICTORY_WINDOW_JUMP=1), {:.0} of those windows were read by no draw; \
-         {:.0} read a record gathered for their list's prelude (VICTORY_INDIRECT_GATHER=1), {:.0} asked for one and got none          (no fit for the clamp {:.0}, the list had stopped gathering {:.0}, too many buffers {:.0}, the set full {:.0}, no buffer {:.0})",
+         {:.0} read a record gathered for their list's prelude (VICTORY_INDIRECT_GATHER=1), {:.0} asked for one and got none          (no fit for the clamp {:.0}, the list had stopped gathering {:.0}, too many buffers {:.0}, the set full {:.0}, no buffer {:.0}); {:.0} run on the title's own records (VICTORY_INDIRECT_TRUST=1); {:.0} lists cut to gather again (VICTORY_GATHER_CUTS=1)",
         n[0],
         n[1..9].iter().sum::<f64>(),
         n[1],
@@ -368,6 +423,8 @@ pub(crate) fn window_line(frames: f64) {
         g[2],
         g[3],
         g[4],
+        TRUSTED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0),
+        GATHER_CUTS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0),
     );
 }
 
@@ -416,6 +473,10 @@ pub(crate) struct State {
     /// whether a draw has read from it since.
     window_jumped: bool,
     window_read: bool,
+    /// With [`gather_cuts`]: a record found its list no longer gathering;
+    /// the title's next indirect command cuts the list first
+    /// (`crate::list`), and the part after the cut gathers again.
+    pub(crate) gather_cut: bool,
     /// Diagnostics: the argument buffer and the offset of the indirect
     /// command before this one on the list.
     #[cfg(feature = "diagnostics")]
@@ -4142,15 +4203,29 @@ impl State {
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
-        let gathered = if hit.is_none() && windowed && gathers() {
+        // `VICTORY_INDIRECT_TRUST=1`: the title's records as they are, no
+        // pass of ours (see [`trust_indirect`]).
+        let trusted = trust_indirect().then(|| {
+            args.refresh(list, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(list, *at, 4);
+            }
+            #[cfg(feature = "diagnostics")]
+            TRUSTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (args.buffer.clone(), offset)
+        });
+        let gathered = if trusted.is_none() && hit.is_none() && windowed && gathers() {
             let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
+            if slot.is_none() && gather_cuts() && list.gather_is_closed() {
+                self.gather_cut = true;
+            }
             #[cfg(feature = "diagnostics")]
             WINDOW_WHY[if slot.is_some() { 12 } else { 13 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             slot
         } else {
             None
         };
-        let (bounded, at) = match (hit, gathered) {
+        let (bounded, at) = if let Some(trusted) = trusted { trusted } else { match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
@@ -4292,7 +4367,7 @@ impl State {
                 });
                 (bounded, 0)
             }
-        };
+        } };
         #[cfg(feature = "diagnostics")]
         {
             self.last_indirect = (args.id(), offset);
