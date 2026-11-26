@@ -221,13 +221,16 @@ const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
+/// Series X on a 1080p set lists a 1080p mode), else `VICTORY_RESOLUTION`
+/// (the title's capped resolution ladder, `victory_game::output`: told a 4K
+/// display it draws its 1080p frame into a quarter of the picture), else
+/// 3840x2160.
 /// shortcut: not yet the host display's own size by default; make it so
 /// once a title is seen to render for the mode it is given.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
+        let asked = std::env::var("VICTORY_DISPLAY_MODE").or_else(|_| std::env::var("VICTORY_RESOLUTION")).ok().and_then(|v| {
             let (w, h) = v.trim().split_once(['x', 'X'])?;
             Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
         });
