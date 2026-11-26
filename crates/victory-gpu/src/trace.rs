@@ -367,7 +367,7 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
         let started = std::time::Instant::now();
         let p0 = crate::host::PREPARING[0].load(Ordering::Relaxed);
         let p1 = crate::host::PREPARING[1].load(Ordering::Relaxed);
-        let mut lists: HashMap<u64, (crate::host::HostList, Vec<(u64, u64)>)> = HashMap::new();
+        let mut lists: HashMap<u64, (crate::host::HostList, Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>)> = HashMap::new();
         let mut i = 0;
         while i < events.len() {
             let e = events[i];
@@ -392,13 +392,16 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
                             v.insert((host.new_list().map_err(|e| format!("a host list: {e}"))?, Vec::new()))
                         }
                     };
-                    let Some(shadow) = crate::shadow::find(e[3], e[4]) else {
+                    // A read goes where a read goes (with `VICTORY_FLAT=1`
+                    // the mirror, `crate::flat`), a write to the copies.
+                    let found = if e[0] == REFRESH { crate::shadow::find_read(e[3], e[4]) } else { crate::shadow::find(e[3], e[4]) };
+                    let Some(shadow) = found else {
                         out.no_copy += 1;
                         continue;
                     };
                     if e[0] == REFRESH {
                         shadow.refresh(&entry.0, e[3], e[4]);
-                        entry.1.push((e[3], e[4]));
+                        entry.1.push((shadow.clone(), e[3], e[4]));
                         out.refreshes += 1;
                     } else {
                         shadow.gpu_writes(&entry.0, e[3], e[4]);
@@ -432,7 +435,7 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
                     let n = e[2] as usize;
                     let ids: Vec<u64> = events[i..i + n].iter().map(|l| l[1]).collect();
                     i += n;
-                    let taken: Vec<(crate::host::HostList, Vec<(u64, u64)>)> =
+                    let taken: Vec<(crate::host::HostList, Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>)> =
                         ids.iter().filter_map(|id| lists.remove(id)).collect();
                     let closing = std::time::Instant::now();
                     for (list, _) in &taken {
@@ -461,8 +464,9 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
                     if verify && out.submissions % every == 0 {
                         let mut by_copy: HashMap<u64, (std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)> = HashMap::new();
                         for (_, ranges) in &taken {
-                            for &(a, n) in ranges {
-                                let Some(shadow) = crate::shadow::find(a, n) else { continue };
+                            // The copy (or window of the mirror) the ask used.
+                            for (shadow, a, n) in ranges {
+                                let (shadow, a, n) = (shadow, *a, *n);
                                 let (start, len) = shadow.span();
                                 let (from, to) = (a.max(start), (a + n.max(1)).min(start + len));
                                 if from < to {
@@ -480,7 +484,14 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
                                 }
                             }
                             for (a, b) in joined {
-                                match shadow.cpu_side(a, b - a).filter(|side| inside(a, side.len() as u64)) {
+                                // A window of the mirror has no CPU side: what
+                                // the card holds is read back.
+                                let shown = if shadow.is_flat() && inside(a, b - a) { crate::flat::shown(a, b - a) } else { None };
+                                let side = match &shown {
+                                    Some(bytes) => Some(&bytes[..]),
+                                    None => shadow.cpu_side(a, b - a),
+                                };
+                                match side.filter(|side| inside(a, side.len() as u64)) {
                                     Some(side) => {
                                         out.checked += 1;
                                         // SAFETY: mapped title memory of the replay.
@@ -511,6 +522,8 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
         out.ms = started.elapsed().as_secs_f64() * 1e3;
         out.copies_ms = (crate::host::PREPARING[0].load(Ordering::Relaxed) - p0) as f64 / 1e3;
         out.copies_mb = (crate::host::PREPARING[1].load(Ordering::Relaxed) - p1) as f64 / f64::from(1 << 20);
+        // The mirror's counts for the pass, per submission (`crate::flat`).
+        crate::flat::line(out.submissions as f64);
         results.push(out);
     }
     Ok(results)

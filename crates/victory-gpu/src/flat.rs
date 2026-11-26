@@ -916,6 +916,31 @@ pub(crate) fn window_raws() -> Vec<usize> {
     made().map_or_else(Vec::new, Space::window_raws)
 }
 
+/// What the host mirror's window shows of `[address, address + len)`,
+/// read back from the card (waits for it: the trace replay's check).
+pub(crate) fn shown(address: u64, len: u64) -> Option<Vec<u8>> {
+    let space = made()?;
+    let host = crate::host::host()?;
+    let window = space.window_made(address)?;
+    if len == 0 || address + len > window.base + space.window_len {
+        return None;
+    }
+    let readback = host.read_back_buffer(len)?;
+    let list = host.new_list().ok()?;
+    // SAFETY: live buffers; the range lies in both.
+    unsafe { list.list.CopyBufferRegion(&readback, 0, &window.resource, address - window.base, len) };
+    list.close();
+    host.execute(&[&list]);
+    let mut data = std::ptr::null_mut();
+    // SAFETY: a read-back buffer of `len` bytes; the card is done with it.
+    unsafe {
+        readback.Map(0, None, Some(&mut data)).ok()?;
+        let bytes = std::slice::from_raw_parts(data.cast::<u8>(), len as usize).to_vec();
+        readback.Unmap(0, None);
+        Some(bytes)
+    }
+}
+
 /// The mirror's line, with the frame-rate line (`frames` since the last).
 fn mirror_line(frames: f64) {
     let Some(space) = made() else {
