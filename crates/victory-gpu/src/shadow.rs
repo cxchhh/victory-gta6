@@ -2091,7 +2091,7 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+pub(crate) fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     if changed_runs_wide_on() { changed_runs_wide(now, was) } else { changed_runs_bytes(now, was) }
 }
 

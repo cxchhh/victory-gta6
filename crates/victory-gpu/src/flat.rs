@@ -55,7 +55,7 @@
 //!   are mirrored once per address.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -129,19 +129,28 @@ pub(crate) fn on() -> bool {
 /// A page's state bits ([`Page::state`]): it has tiles (or they are
 /// given at the next submission); shaders may write it, so it is the
 /// copies'; a refresh named it since the last frame line.
-const MAPPED: u8 = 1;
-const GPU: u8 = 2;
-const USED: u8 = 4;
+const MAPPED: u16 = 1;
+const GPU: u16 = 2;
+const USED: u16 = 4;
 /// With [`writes`]: the card owns the page (shaders of a submission sent
 /// wrote it; its title memory is `PAGE_NOACCESS` and older than the
 /// mirror); a thread is fetching it back; it was looked at and can be
 /// owned (plain write-watched read-write memory), or cannot; a submission
 /// being prepared will write it (its title memory is read-only meanwhile).
-const CARD: u8 = 8;
-const RESOLVING: u8 = 16;
-const OWNABLE: u8 = 32;
-const NOT_OWNABLE: u8 = 64;
-const PENDING: u8 = 128;
+const CARD: u16 = 8;
+const RESOLVING: u16 = 16;
+const OWNABLE: u16 = 32;
+const NOT_OWNABLE: u16 = 64;
+const PENDING: u16 = 128;
+/// The CPU wrote a page the card owned ([`Space::fault`] with a write):
+/// its title memory is read-write again and holds the CPU's bytes over
+/// the ones the card had then; a snapshot of those is kept, and the next
+/// submission sends only what differs from it ([`Space::begin`]). Bytes
+/// the card wrote there are not in title memory meanwhile.
+const CPUW: u16 = 256;
+/// The page's CPU bytes go up as runs that differ from its snapshot in
+/// this submission: the send of whole pages leaves it alone.
+const MERGING: u16 = 512;
 
 /// [`Page::layout`]: the note is there; every title buffer on the page
 /// starts on 16 bytes; no buffer starts or ends inside the page, and the
@@ -158,7 +167,7 @@ const CELL: u64 = 4 << 20;
 /// One 64 KiB page of a window.
 #[derive(Default)]
 struct Page {
-    state: AtomicU8,
+    state: AtomicU16,
     /// The write watch's asking after which the page was last sent (0:
     /// never, or to be sent again).
     sent: AtomicU64,
@@ -230,7 +239,40 @@ struct Slot {
     /// used again: the card's time of the mirror's copies).
     stamps: Option<(ID3D12QueryHeap, ID3D12Resource, *const u64)>,
     timed: bool,
+    /// The list of its merges ([`Space::record_merges`]), made on first use.
+    merge: Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
 }
+
+/// A page the CPU wrote while the card owned it ([`CPUW`]): its window,
+/// its number there, and its title bytes as they were before the write.
+type Merge = (Arc<Window>, usize, Box<[u8]>);
+
+/// The merge of a page the CPU wrote while the card owned it: `src` holds
+/// the page's title bytes and, a page further, its snapshot; each byte
+/// that differs between the two goes into the window (`dst`), every other
+/// byte of the window stays as the card has it. One thread a dword.
+const MERGE: &str = r#"
+#define RS "SRV(t0), UAV(u0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void merge(uint id : SV_DispatchThreadID) {
+    uint at = id * 4;
+    uint now = src.Load(at);
+    uint was = src.Load(65536 + at);
+    uint diff = now ^ was;
+    if (diff == 0) {
+        return;
+    }
+    uint mask = 0;
+    if ((diff & 0x000000ffu) != 0) { mask |= 0x000000ffu; }
+    if ((diff & 0x0000ff00u) != 0) { mask |= 0x0000ff00u; }
+    if ((diff & 0x00ff0000u) != 0) { mask |= 0x00ff0000u; }
+    if ((diff & 0xff000000u) != 0) { mask |= 0xff000000u; }
+    dst.Store(at, (dst.Load(at) & ~mask) | (now & mask));
+}
+"#;
 
 /// Since the last frame line (the ones marked so: since the start).
 #[derive(Clone, Copy)]
@@ -278,6 +320,14 @@ pub(crate) enum S {
     TouchedOut,
     NotTaken,
     Eager,
+    /// Writes of the CPU to pages the card owned taken without a wait
+    /// (snapshot), and the runs and bytes of them sent up later; of the
+    /// pages fetched back, those the card had not changed and those it had.
+    Snapped,
+    MergedRuns,
+    MergedBytes,
+    FetchedSame,
+    FetchedChanged,
     /// The part of the send spent looking for written pages, and copying
     /// (microseconds).
     ScanUs,
@@ -326,6 +376,27 @@ pub(crate) struct Space {
     fence: Mutex<Option<ID3D12Fence>>,
     /// The fetch's own copy queue, list, read-back memory and fence.
     fetch: Mutex<Option<Fetch>>,
+    /// Pages in [`CPUW`]: the title's bytes of each as they were when the
+    /// CPU first wrote it.
+    snaps: Mutex<Vec<(Arc<Window>, usize, Box<[u8]>)>>,
+    /// The merge program ([`MERGE`]): made on first use (`None` inside if
+    /// it could not be).
+    merger: Mutex<Option<Option<(ID3D12RootSignature, ID3D12PipelineState)>>>,
+}
+
+/// Whether a CPU write to a page the card owns is taken at once, with a
+/// snapshot ([`CPUW`]; `VICTORY_FLAT_SNAP=0`: it waits for the card and
+/// fetches the page, as a read does).
+fn snap_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FLAT_SNAP").is_none_or(|v| v != "0"))
+}
+
+/// The most neighbouring pages the card owns fetched with one a read
+/// touched (`VICTORY_FLAT_FETCH_PAGES`, 16).
+fn fetch_pages() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_FLAT_FETCH_PAGES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16).max(1))
 }
 
 /// What fetches pages back from the card: a copy queue of its own (the
@@ -540,7 +611,8 @@ pub(crate) fn submit(
     let owning = space.begin(&written);
     let mut ranges = ranges;
     ranges.extend(owning.as_ref().map_or(&[][..], |o| &o.named[..]).iter().copied());
-    space.upload(queue, fence, next, &ranges);
+    let merges = owning.as_ref().map_or(&[][..], |o| &o.merges[..]);
+    space.upload_with(queue, fence, next, &ranges, merges);
     owning
 }
 
@@ -555,6 +627,9 @@ pub(crate) struct Owning<'a> {
     eager: Vec<(Arc<Window>, usize)>,
     /// Their ranges, for the upload ahead of the submission.
     named: Vec<(usize, usize)>,
+    /// Pages the CPU wrote while the card owned them ([`CPUW`]), with
+    /// their snapshots: what differs goes into the mirror ([`Merge`]).
+    merges: Vec<Merge>,
     sent: bool,
 }
 
@@ -572,7 +647,7 @@ impl Owning<'_> {
             if state & PENDING != 0 {
                 let at = window.base + *page as u64 * PAGE;
                 protect(at, PAGE, PAGE_NOACCESS);
-                p.state.fetch_and(!PENDING, Ordering::AcqRel);
+                p.state.fetch_and(!(PENDING | MERGING), Ordering::AcqRel);
                 p.state.fetch_or(CARD, Ordering::AcqRel);
                 space.add(S::Owned, 1);
             }
@@ -599,7 +674,7 @@ impl Drop for Owning<'_> {
             // Not sent: the pages stay the CPU's.
             for (window, page) in &self.pages {
                 let p = &window.pages[*page];
-                if p.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
+                if p.state.fetch_and(!(PENDING | MERGING), Ordering::AcqRel) & PENDING != 0 {
                     protect(window.base + *page as u64 * PAGE, PAGE, PAGE_READWRITE);
                     self.space.owned.fetch_sub(1, Ordering::AcqRel);
                 }
@@ -694,6 +769,8 @@ impl Space {
             owned: AtomicU64::new(0),
             fence: Mutex::new(None),
             fetch: Mutex::new(None),
+            snaps: Mutex::new(Vec::new()),
+            merger: Mutex::new(None),
         })
     }
 
@@ -970,8 +1047,8 @@ impl Space {
     fn forget(&self, address: u64, len: u64) {
         self.each_page(address, len, |page| {
             page.sent.store(0, Ordering::Release);
-            let state = page.state.fetch_and(!(CARD | PENDING | RESOLVING | OWNABLE | NOT_OWNABLE), Ordering::AcqRel);
-            if state & (CARD | PENDING) != 0 {
+            let state = page.state.fetch_and(!(CARD | PENDING | RESOLVING | OWNABLE | NOT_OWNABLE | CPUW | MERGING), Ordering::AcqRel);
+            if state & (CARD | PENDING | CPUW) != 0 {
                 self.owned.fetch_sub(1, Ordering::AcqRel);
             }
         });
@@ -983,13 +1060,36 @@ impl Space {
     /// the submission holds every byte the title wrote before. `None` if
     /// nothing is written.
     pub(crate) fn begin(&self, written: &[(usize, usize)]) -> Option<Owning<'_>> {
-        if written.is_empty() || !self.gpu {
+        if !self.gpu || (written.is_empty() && self.snaps.lock().unwrap_or_else(|e| e.into_inner()).is_empty()) {
             return None;
         }
         let lock = self.owning.lock().unwrap_or_else(|e| e.into_inner());
         SUBMITTING.with(|s| s.set(true));
-        let mut owning = Owning { space: self, _lock: lock, pages: Vec::new(), eager: Vec::new(), named: Vec::new(), sent: false };
+        let mut owning =
+            Owning { space: self, _lock: lock, pages: Vec::new(), eager: Vec::new(), named: Vec::new(), merges: Vec::new(), sent: false };
         let mut seen = HashSet::new();
+        // Pages the CPU wrote since the card owned them: read-only now (a
+        // write from here on waits), the bytes that differ from the
+        // snapshot go into the mirror (on the card, ahead of the lists),
+        // and the card owns them again behind this submission. (Read-only,
+        // the bytes sent are the bytes compared.)
+        let snaps = std::mem::take(&mut *self.snaps.lock().unwrap_or_else(|e| e.into_inner()));
+        for (window, page, snap) in snaps {
+            let p = &window.pages[page];
+            if p.state.load(Ordering::Acquire) & CPUW == 0 {
+                continue;
+            }
+            let at = window.base + page as u64 * PAGE;
+            if protect(at, PAGE, PAGE_READONLY).is_none() {
+                continue;
+            }
+            self.add(S::MergedRuns, 1);
+            p.state.fetch_and(!CPUW, Ordering::AcqRel);
+            p.state.fetch_or(PENDING | MERGING, Ordering::AcqRel);
+            seen.insert(at / PAGE);
+            owning.pages.push((window.clone(), page));
+            owning.merges.push((window, page, snap));
+        }
         for (a, e) in page_runs(written.iter().map(|&(a, n)| (a as u64, (a + n.max(1)) as u64)).collect()) {
             for number in a..e {
                 let Some(window) = self.window_made(number * PAGE).cloned() else {
@@ -1006,6 +1106,12 @@ impl Space {
                 let state = p.state.load(Ordering::Acquire);
                 if state & (CARD | RESOLVING) != 0 {
                     owning.pages.push((window, page));
+                    continue;
+                }
+                if state & CPUW != 0 {
+                    // Written by the CPU after the snapshots were taken
+                    // above: not possible (the lock is held), but never
+                    // sent whole over the card's bytes.
                     continue;
                 }
                 let at = number * PAGE;
@@ -1034,7 +1140,7 @@ impl Space {
                 let page = window.page(at);
                 // (A page being made the card's is read-only meanwhile: our
                 // own reads of it, the upload's, need nothing.)
-                let mine = if SUBMITTING.with(std::cell::Cell::get) { CARD | RESOLVING } else { CARD | PENDING | RESOLVING };
+                let mine = if SUBMITTING.with(std::cell::Cell::get) { CARD | RESOLVING } else { CARD | PENDING | RESOLVING | CPUW };
                 if page < window.pages.len() && window.pages[page].state.load(Ordering::Acquire) & mine != 0 {
                     pages.push((window.clone(), page));
                 }
@@ -1069,11 +1175,50 @@ impl Space {
             self.add(S::NotTaken, 1);
             return Some(false);
         }
+        if write && snap_writes() && self.snap(window, page) {
+            self.add(S::Snapped, 1);
+            return Some(true);
+        }
         let started = std::time::Instant::now();
-        let taken = self.resolve(vec![(window.clone(), page)], write);
+        // A read: the neighbours the card owns come along, in one copy.
+        let mut pages = vec![(window.clone(), page)];
+        let owned = |p: &Page| p.state.load(Ordering::Acquire) & (CARD | RESOLVING) != 0;
+        let mut next = page + 1;
+        while pages.len() < fetch_pages() && next < window.pages.len() && owned(&window.pages[next]) {
+            pages.push((window.clone(), next));
+            next += 1;
+        }
+        let taken = self.resolve(pages, write);
         self.add(S::Faulted, 1);
         self.add(S::FetchUs, started.elapsed().as_micros() as u64);
         Some(taken)
+    }
+
+    /// A CPU write to page `page` of `window`, which the card owns: taken
+    /// at once. The page's title bytes as they are (older than the card's)
+    /// are kept, the page is read-write again ([`CPUW`]). False if the page
+    /// is not simply the card's now (being fetched, or being made the
+    /// card's): the caller fetches it.
+    fn snap(&self, window: &Arc<Window>, page: usize) -> bool {
+        let Some(_lock) = self.lock_owning() else {
+            return false;
+        };
+        let p = &window.pages[page];
+        let state = p.state.load(Ordering::Acquire);
+        if state & CARD == 0 || state & (RESOLVING | PENDING) != 0 {
+            return false;
+        }
+        let at = window.base + page as u64 * PAGE;
+        if protect(at, PAGE, PAGE_READWRITE).is_none() {
+            return false;
+        }
+        // SAFETY: the title's page, readable now; nobody writes it before
+        // the faulting write goes on.
+        let snap: Box<[u8]> = unsafe { std::slice::from_raw_parts(at as *const u8, PAGE as usize) }.into();
+        p.state.fetch_and(!CARD, Ordering::AcqRel);
+        p.state.fetch_or(CPUW, Ordering::AcqRel);
+        self.snaps.lock().unwrap_or_else(|e| e.into_inner()).push((window.clone(), page, snap));
+        true
     }
 
     /// The owning lock, waited for [`WAIT_LIMIT`] at most.
@@ -1112,7 +1257,7 @@ impl Space {
                     .filter_map(|(window, page)| {
                         let p = &window.pages[page];
                         let state = p.state.load(Ordering::Acquire);
-                        if state & (CARD | RESOLVING) == 0 {
+                        if state & (CARD | RESOLVING | CPUW) == 0 {
                             return None;
                         }
                         p.state.fetch_or(RESOLVING, Ordering::AcqRel);
@@ -1136,7 +1281,8 @@ impl Space {
             };
             for (i, (window, page, fence)) in taken.into_iter().enumerate() {
                 let p = &window.pages[page];
-                if p.fence.load(Ordering::Acquire) != fence || p.state.load(Ordering::Acquire) & CARD == 0 {
+                let state = p.state.load(Ordering::Acquire);
+                if p.fence.load(Ordering::Acquire) != fence || state & (CARD | CPUW) == 0 {
                     // Written again by a later submission (or let go):
                     // fetched again behind it, if still the card's.
                     pages.push((window, page));
@@ -1144,18 +1290,33 @@ impl Space {
                 }
                 let at = window.base + page as u64 * PAGE;
                 protect(at, PAGE, PAGE_READWRITE);
-                // SAFETY: the page is the title's, read-write now; the
-                // fetched bytes are one page.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes[i * PAGE as usize..].as_ptr(), at as *mut u8, PAGE as usize);
+                let mut fetched = bytes[i * PAGE as usize..(i + 1) * PAGE as usize].to_vec();
+                // SAFETY: the page is the title's, read-write now.
+                let title = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, PAGE as usize) };
+                if state & CPUW != 0 {
+                    // The CPU wrote it since: its bytes go over the card's
+                    // where they differ from the snapshot; the mirror takes
+                    // the whole page at its next send.
+                    let mut snaps = self.snaps.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(at_snap) = snaps.iter().position(|(w, pg, _)| Arc::ptr_eq(w, &window) && *pg == page) {
+                        let (_, _, snap) = snaps.swap_remove(at_snap);
+                        for (off, n) in crate::shadow::changed_runs(title, &snap) {
+                            fetched[off..off + n].copy_from_slice(&title[off..off + n]);
+                        }
+                    }
+                } else if fetched[..] == title[..] {
+                    self.add(S::FetchedSame, 1);
+                } else {
+                    self.add(S::FetchedChanged, 1);
                 }
+                title.copy_from_slice(&fetched);
                 // Every other copy of these bytes takes them again; the
                 // mirror holds them already (the write-watch bits our copy
                 // set make it send the page once more, which costs a page
                 // and loses nothing).
                 let (_, now) = crate::watch::wrote_own((at / PAGE) as usize, &[]);
-                p.sent.store(now, Ordering::Release);
-                p.state.fetch_and(!(CARD | RESOLVING), Ordering::AcqRel);
+                p.sent.store(if state & CPUW != 0 { 0 } else { now }, Ordering::Release);
+                p.state.fetch_and(!(CARD | RESOLVING | CPUW), Ordering::AcqRel);
                 self.owned.fetch_sub(1, Ordering::AcqRel);
                 let most = touches_most();
                 if write && most > 0 && p.touches.fetch_add(1, Ordering::AcqRel) + 1 >= most {
@@ -1285,6 +1446,19 @@ impl Space {
 
     /// See [`submit`]. Returns the pages sent.
     pub(crate) fn upload(&self, queue: &ID3D12CommandQueue, fence: &ID3D12Fence, next: u64, ranges: &[(usize, usize)]) -> u64 {
+        self.upload_with(queue, fence, next, ranges, &[])
+    }
+
+    /// [`Space::upload`], and the merges of pages the CPU wrote while the
+    /// card owned them.
+    pub(crate) fn upload_with(
+        &self,
+        queue: &ID3D12CommandQueue,
+        fence: &ID3D12Fence,
+        next: u64,
+        ranges: &[(usize, usize)],
+        merges: &[Merge],
+    ) -> u64 {
         let started = std::time::Instant::now();
         let _ = self.fence.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| fence.clone());
         // The pages named, in order, none touching another, and cut at the
@@ -1309,7 +1483,7 @@ impl Space {
             }
         }
         self.map_given(queue);
-        if named.is_empty() {
+        if named.is_empty() && merges.is_empty() {
             return 0;
         }
         self.add(S::PagesNamed, run_pages(&named));
@@ -1345,7 +1519,8 @@ impl Space {
                     continue;
                 }
                 // The card owns it: the mirror is newer than title memory.
-                if state & (CARD | RESOLVING) != 0 {
+                // Or the CPU's bytes of it are merged (`merges`).
+                if state & (CARD | RESOLVING | MERGING | CPUW) != 0 {
                     continue;
                 }
                 let sent = page.sent.load(Ordering::Acquire);
@@ -1363,12 +1538,12 @@ impl Space {
         }
         crate::watch::ask_ahead_done();
         self.add(S::ScanUs, started.elapsed().as_micros() as u64);
-        if send.is_empty() {
+        if send.is_empty() && merges.is_empty() {
             self.add(S::SendUs, started.elapsed().as_micros() as u64);
             return 0;
         }
         let total: u64 = send.iter().map(|r| r.2 - r.1).sum();
-        let sent = self.send(queue, fence, next, &send, total);
+        let sent = self.send(queue, fence, next, &send, total, merges);
         self.add(S::SendUs, started.elapsed().as_micros() as u64);
         if sent {
             self.add(S::PagesSent, total / PAGE);
@@ -1441,7 +1616,17 @@ impl Space {
     /// Copies the runs (title addresses) into upload memory of a slot the
     /// card is done with, and executes a list that copies them into the
     /// windows. False if no slot could be had.
-    fn send(&self, queue: &ID3D12CommandQueue, fence: &ID3D12Fence, next: u64, runs: &[(Arc<Window>, u64, u64)], total: u64) -> bool {
+    fn send(
+        &self,
+        queue: &ID3D12CommandQueue,
+        fence: &ID3D12Fence,
+        next: u64,
+        runs: &[(Arc<Window>, u64, u64)],
+        total: u64,
+        merges: &[Merge],
+    ) -> bool {
+        // The merges' pages and snapshots follow the runs' bytes.
+        let total = total + merges.len() as u64 * 2 * PAGE;
         let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a plain query.
         let done = unsafe { fence.GetCompletedValue() };
@@ -1491,7 +1676,24 @@ impl Space {
             crate::host::copy_mapped(to, *a as *const u8, (*e - *a) as usize, false);
             offset += *e - *a;
         }
+        let merged_at = offset;
+        for (window, page, snap) in merges {
+            let at = window.base + *page as u64 * PAGE;
+            // SAFETY: inside the upload mapping (two pages for each merge).
+            unsafe {
+                crate::host::copy_mapped(data.add(offset as usize), at as *const u8, PAGE as usize, false);
+                std::ptr::copy_nonoverlapping(snap.as_ptr(), data.add((offset + PAGE) as usize), PAGE as usize);
+            }
+            offset += 2 * PAGE;
+        }
         self.add(S::CopyUs, copying.elapsed().as_micros() as u64);
+        if !merges.is_empty() && !self.record_merges(queue, slot, &staging, merged_at, merges) {
+            return false;
+        }
+        if runs.is_empty() {
+            slot.fence = next;
+            return true;
+        }
         // SAFETY: the slot's list ran (the fence passed it); live buffers,
         // the runs lie in them.
         let recorded = unsafe {
@@ -1522,6 +1724,81 @@ impl Space {
         }
         slot.fence = next;
         true
+    }
+
+    /// Records and executes, ahead of the runs' copies, the merges of pages
+    /// the CPU wrote while the card owned them: each page's title bytes and
+    /// snapshot lie side by side in `staging` from `at` on, and the merge
+    /// stores into the window only the bytes where the two differ
+    /// ([`MERGE`]). Its own list and `ExecuteCommandLists`: the window is
+    /// written as unordered access here and as a copy destination there.
+    fn record_merges(&self, queue: &ID3D12CommandQueue, slot: &mut Slot, staging: &ID3D12Resource, at: u64, merges: &[Merge]) -> bool {
+        let Some((root, pso)) = self.merger() else {
+            tracing::warn!("no merge program for the mirror of title memory: pages the CPU wrote stay as the card has them");
+            return false;
+        };
+        if slot.merge.is_none() {
+            // SAFETY: plain object creation.
+            slot.merge = unsafe {
+                (|| -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+                    let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                    list.Close()?;
+                    Ok((allocator, list))
+                })()
+                .ok()
+            };
+        }
+        let Some((allocator, list)) = &slot.merge else {
+            return false;
+        };
+        // SAFETY: the slot's lists ran (its fence passed); live buffers; the
+        // program's own root signature.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pso);
+                let base = staging.GetGPUVirtualAddress() + at;
+                for (i, (window, page, _)) in merges.iter().enumerate() {
+                    list.SetComputeRootShaderResourceView(0, base + i as u64 * 2 * PAGE);
+                    list.SetComputeRootUnorderedAccessView(1, window.resource.GetGPUVirtualAddress() + *page as u64 * PAGE);
+                    list.Dispatch((PAGE / 4 / 64) as u32, 1, 1);
+                }
+                list.Close()?;
+                queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(list)?)]);
+                Ok(())
+            })()
+        };
+        if let Err(e) = recorded {
+            tracing::warn!(error = %e, "the merges of the mirror of title memory could not be sent");
+            return false;
+        }
+        true
+    }
+
+    /// The merge program ([`MERGE`]), made on first use.
+    fn merger(&self) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        let mut merger = self.merger.lock().unwrap_or_else(|e| e.into_inner());
+        merger
+            .get_or_insert_with(|| {
+                let code = crate::host::compile(MERGE, windows::core::s!("merge"), windows::core::s!("cs_5_1")).ok()?;
+                // SAFETY: the program's own root signature; plain creation.
+                unsafe {
+                    let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &code).ok()?;
+                    let pso: ID3D12PipelineState = self
+                        .device
+                        .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                            pRootSignature: std::mem::transmute_copy(&root),
+                            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                            ..Default::default()
+                        })
+                        .ok()?;
+                    Some((root, pso))
+                }
+            })
+            .clone()
     }
 
     fn make_slot(&self) -> Option<Slot> {
@@ -1557,7 +1834,7 @@ impl Space {
                 back.Map(0, None, Some(&mut mapped)).ok()?;
                 Some((heap?, back, mapped.cast_const().cast::<u64>()))
             })();
-            Some(Slot { allocator, list, staging: None, fence: 0, stamps, timed: false })
+            Some(Slot { allocator, list, staging: None, fence: 0, stamps, timed: false, merge: None })
         }
     }
 
@@ -1696,7 +1973,7 @@ fn mirror_line(frames: f64) {
         mb(used * PAGE),
     );
     tracing::info!(
-        "flat mirror per frame, its parts: the send's looking for written pages {:.2} ms and copying {:.2} ms, the card's          copies into the windows {:.2} ms; shader writes          (VICTORY_FLAT=2): {:.0} pages written in the mirror, {:.1} came to be the card's, fetched back {:.1} by a touch and          {:.1} by our readers in {:.2} ms, {:.2} left the mirror after CPU writes, {:.1} asks to the copies (memory the card          cannot own), {:.1} fetched at once (not protectable), {:.2} touches not taken; owned now {} pages",
+        "flat mirror per frame, its parts: the send's looking for written pages {:.2} ms and copying {:.2} ms, the card's          copies into the windows {:.2} ms; shader writes          (VICTORY_FLAT=2): {:.0} pages written in the mirror, {:.1} came to be the card's, fetched back {:.1} by a touch and          {:.1} by our readers in {:.2} ms, {:.2} left the mirror after CPU writes, {:.1} asks to the copies (memory the card          cannot own), {:.1} fetched at once (not protectable), {:.2} touches not taken; CPU writes taken at once {:.1}, pages merged on the card {:.1} ({:.1} MB staged); of the pages fetched {:.1} the card had not changed and {:.1} it had; owned now {} pages",
         f(S::ScanUs) / 1000.0,
         f(S::CopyUs) / 1000.0,
         f(S::CardUs) / 1000.0,
@@ -1709,6 +1986,11 @@ fn mirror_line(frames: f64) {
         f(S::ToCopiesNotOwnable),
         f(S::Eager),
         f(S::NotTaken),
+        f(S::Snapped),
+        f(S::MergedRuns),
+        mb(s[S::MergedRuns as usize] * 2 * PAGE) / frames,
+        f(S::FetchedSame),
+        f(S::FetchedChanged),
         space.owned.load(Ordering::Relaxed),
     );
 }
@@ -2486,7 +2768,7 @@ void store() {
         let owning = space.begin(&[(page as usize, 256)]).expect("pages written");
         let mut ranges = vec![(page as usize, 256)];
         ranges.extend(owning.named.iter().copied());
-        space.upload(&rig.queue, &rig.fence, rig.value + 1, &ranges);
+        space.upload_with(&rig.queue, &rig.fence, rig.value + 1, &ranges, &owning.merges);
         // SAFETY: plain creation; an open list; live buffers; our queue.
         unsafe {
             if let Some(gate) = gate {
@@ -2552,6 +2834,8 @@ void store() {
         // the write goes on.
         // SAFETY: title memory of the test.
         unsafe { ((page + 8) as *mut u32).write_volatile(0x0000_00B2) };
+        let stats = space.take_stats();
+        assert_eq!((stats[S::Snapped as usize], stats[S::Faulted as usize]), (1, 0), "the write was taken at once, nothing fetched");
         // The second submission's shaders write another dword; its upload
         // takes the CPU's write.
         let _second = store_submission(&mut rig, space, &program, page, 32, 0x0000_00C3, None);
