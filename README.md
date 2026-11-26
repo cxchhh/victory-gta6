@@ -744,9 +744,9 @@ title's window has focus:
 |------|-----|
 | W A S D / I J K L | left / right stick |
 | arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
+| Space, Backspace, X, Y | A, B, X, Y |
 | Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
+| left Shift / middle mouse button | stick clicks |
 | Esc, Tab | Menu, View |
 
 ## Commands

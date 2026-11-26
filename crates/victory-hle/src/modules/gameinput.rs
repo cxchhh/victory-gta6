@@ -62,11 +62,13 @@ const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
+/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. A is Space, the
+/// stick clicks left Shift and the middle mouse button (the user's layout,
+/// 2026-11-26; they were Enter, F and H).
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
+    (0x20, A),    // Space
     (0x08, B),    // Backspace
     (b'X', X),
     (b'Y', Y),
@@ -76,8 +78,8 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x27, RIGHT),
     (b'Q', LEFT_SHOULDER),
     (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
-    (b'H', RIGHT_STICK),
+    (0xA0, LEFT_STICK),  // left Shift
+    (0x04, RIGHT_STICK), // middle mouse button
 ];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
@@ -460,6 +462,9 @@ impl State {
         }
         let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
+        // The middle mouse button is a stick click of the stand-in pad, not
+        // a key of the keyboard.
+        let keys = keys.into_iter().filter(|k| k.virtual_key >= 0x08).collect();
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -1175,6 +1180,12 @@ mod host {
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
                 down.extend(held);
+                // The middle mouse button, for the stand-in pad only
+                // (`FALLBACK_BUTTONS`; the keyboard device leaves it out).
+                // SAFETY: plain query.
+                if unsafe { GetAsyncKeyState(0x04) } < 0 && !down.contains(&0x04) {
+                    down.push(0x04);
+                }
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1198,13 +1209,15 @@ mod host {
         }
     }
 
-    /// The virtual key a scripted key names: a letter, a digit, or `Enter`,
+    /// The virtual key a scripted key names: a letter, a digit, or `Space`, `Shift`, `Enter`,
     /// `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's
     /// table maps them to buttons, W/A/S/D to the left stick).
     #[cfg(feature = "diagnostics")]
     fn scripted_vk(key: &str) -> Option<u8> {
         Some(match key.trim() {
             "Enter" => 0x0D,
+            "Space" => 0x20,
+            "Shift" => 0xA0,
             "Esc" => 0x1B,
             "Tab" => 0x09,
             "Back" => 0x08,
@@ -1534,7 +1547,7 @@ mod tests {
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
+        let keys = vec![key(b'W'), key(0x20), key(b'L'), key(b'C')];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
