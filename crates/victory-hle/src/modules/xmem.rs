@@ -700,7 +700,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_at(|| touched(&physical, base, n * PAGE));
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -769,7 +769,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_at(|| touched(&physical, to, len));
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -890,6 +890,27 @@ fn commit_limit_message(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+/// The addresses a change of `[base, base + len)` touches: that range and
+/// every view overlapping it, whole ([`unmap`] takes those away and maps
+/// again what of them lies outside; [`map`] maps only inside the range).
+/// What `victory_gpu::title_memory_remapping_at` keeps reads of texture
+/// memory out of.
+fn touched(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
+    let end = base.saturating_add(len);
+    // The view holding `base`, then those starting inside, as [`unmap`]
+    // finds them.
+    let holding = physical
+        .views
+        .range(..=base)
+        .next_back()
+        .filter(|(at, (size, _))| **at + *size > base);
+    let inside = physical.views.range(base.saturating_add(1)..end.max(base.saturating_add(1)));
+    holding
+        .into_iter()
+        .chain(inside)
+        .fold((base, end), |(from, to), (&at, &(size, _))| (from.min(at), to.max(at + size)))
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -1355,6 +1376,35 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         assert!(reader.join().expect("the reader never faulted") > 0);
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// What a change of mapping touches (`VICTORY_REMAP_RANGES`): the range
+    /// asked for and every view that overlaps it, whole, for `unmap` takes
+    /// those away and maps the rest of them again; nothing beside them.
+    #[test]
+    fn a_remapping_touches_the_views_it_cuts_whole() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let a = a as usize;
+        // One view of three pages (consecutive pages of one section).
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 3, pages.as_ptr()), a as *mut c_void);
+        assert_eq!(touched(&physical(), a + PAGE, PAGE), (a, a + 3 * PAGE), "the middle page cuts the view");
+        assert_eq!(touched(&physical(), a + PAGE + 0x10, 0), (a, a + 3 * PAGE));
+        // The middle page unmapped: two views, and the middle touches
+        // neither.
+        assert_eq!(XMemMapPhysicalPages((a + PAGE) as *mut c_void, 1, std::ptr::null()), (a + PAGE) as *mut c_void);
+        assert_eq!(touched(&physical(), a + PAGE, PAGE), (a + PAGE, a + 2 * PAGE));
+        assert_eq!(touched(&physical(), a + PAGE, 2 * PAGE), (a + PAGE, a + 3 * PAGE));
+        assert_eq!(touched(&physical(), a + PAGE / 2, PAGE), (a, a + PAGE + PAGE / 2));
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 3, std::ptr::null()), a as *mut c_void);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 

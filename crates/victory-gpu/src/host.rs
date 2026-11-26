@@ -2447,6 +2447,11 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// As `Host`, for work that touches only this texture's upload state
+    /// (its staging and its levels' tiles) and reads nothing a refresh of
+    /// another texture writes: with [`wide_textures`] it runs after this
+    /// texture's pending refresh, and need not wait for the others'.
+    Staged(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<dyn Fn() + Send + Sync>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -3256,7 +3261,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::Staged(..) => {}
             }
         }
     }
@@ -6470,6 +6475,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         part = prep_part(1, part);
+        batch.flush_textures();
         batch.flush();
         crate::watch::ask_once_end();
         part = prep_part(2, part);
@@ -8205,13 +8211,31 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// As [`HostList::defer_host`], for work on `staging`'s texture's
+    /// upload state alone ([`Step::Staged`]).
+    pub(crate) fn defer_staged(
+        &self,
+        staging: &std::sync::Arc<crate::texture::Staging>,
+        work: impl Fn() + Send + Sync + 'static,
+    ) {
+        self.deferred().copies.push(Step::Staged(staging.clone(), std::sync::Arc::new(work)));
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // Read once per list: `alt` may turn while the steps run.
+        let wide = wide_textures();
         for step in &self.deferred().copies {
+            // Texture refreshes left for the helper threads are done before
+            // any step that may write title memory or reads what a refresh
+            // writes ([`Batch::textures_wait`]).
+            if batch.textures_wait(step) {
+                batch.flush_textures();
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -8287,7 +8311,25 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if wide {
+                            batch.texture_later(staging);
+                        } else {
+                            staging.refresh();
+                        }
+                    }
+                    continue;
+                }
+                Step::Staged(staging, work) => {
+                    // Its texture's refresh is still to be done: after it.
+                    if batch.texture_pending(staging) {
+                        batch.after_textures(work.clone());
+                        continue;
+                    }
+                    work();
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Runs, 1);
+                        add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
                     continue;
                 }
@@ -8339,6 +8381,68 @@ fn wide_refresh() -> bool {
         }
     }
 }
+
+/// Whether a submission's texture refreshes run on several threads
+/// (`VICTORY_WIDE_TEXTURES=1`; off by default: one after the other on the
+/// submitting thread, at their steps).
+///
+/// The refreshes that are due between two steps that write title memory
+/// (or may read what a refresh writes: [`Batch::textures_wait`]) are left
+/// for later and done together when such a step comes, and before the
+/// submission's last refreshes of buffer copies: each on its own, over the
+/// threads kept for the snapshots (`crate::shadow::wide`), across the
+/// submission's lists. They have nothing to do with one another: each
+/// texture has its own lock, staging buffer and notes, and reads title
+/// memory, which none of them writes. Each still reads title memory as it
+/// is at its step's position as far as our steps go: no step of ours that
+/// writes it is passed. A texture's upload work ([`Step::Staged`]) runs
+/// after its own refresh as before; the upload work of two textures may
+/// now run in the other order (each touches its own texture's state, and
+/// the tiles of levels on demand are given in that order).
+///
+/// What it is for: the frame line's "textures" is 11-15 ms a frame
+/// standing still and 100-920 ms a frame while the world streams in (run
+/// keep1), all on the submitting thread. Most of that is waiting for the
+/// runtime to stop remapping title memory (frame 2019: 875.5 ms of 919.5;
+/// `crate::watch::remap_ranges` is the switch for that): while it waits,
+/// one thread refreshes nothing; several take their textures in the same
+/// gap between two changes of mapping. The rest is reading, hashing and
+/// detiling (38 ms a frame there), which spreads over the threads.
+///
+/// Each helper thread that reads a texture through the kernel keeps a
+/// read buffer the size of the largest such texture it read
+/// (`crate::texture`'s `with_read`), as the submitting thread does.
+///
+/// `VICTORY_WIDE_TEXTURES=alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log.
+fn wide_textures() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_WIDE_TEXTURES").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a submission's texture refreshes are spread over the helper threads from now (VICTORY_WIDE_TEXTURES=alt): {}",
+                    if on { "ON" } else { "off, one after the other as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the last frame-rate line, with [`wide_textures`]: textures
+/// refreshed together, the times they were (a flush of one counts), the
+/// time that took (microseconds) and the threads' time in all.
+static WIDE_TEXTURES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Whether a range of a host copy brought up to date in a submission is
 /// left alone for the rest of that submission, until a step of ours writes
@@ -8411,6 +8515,12 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`wide_textures`]: the texture refreshes due and not done yet,
+    /// their staging buffers by address, and the [`Step::Staged`] work that
+    /// waits for them, in recorded order ([`Batch::flush_textures`]).
+    later: Vec<std::sync::Arc<crate::texture::Staging>>,
+    later_keys: std::collections::HashSet<usize>,
+    after: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Batch {
@@ -8494,6 +8604,86 @@ impl Batch {
     /// notes it refreshed).
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    }
+
+    /// With [`wide_textures`]: `staging`'s refresh is due, and is left for
+    /// [`Batch::flush_textures`].
+    fn texture_later(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) {
+        self.later_keys.insert(std::sync::Arc::as_ptr(staging) as usize);
+        self.later.push(staging.clone());
+    }
+
+    /// Whether `staging`'s refresh is left for [`Batch::flush_textures`].
+    fn texture_pending(&self, staging: &std::sync::Arc<crate::texture::Staging>) -> bool {
+        !self.later.is_empty() && self.later_keys.contains(&(std::sync::Arc::as_ptr(staging) as usize))
+    }
+
+    /// Work of a [`Step::Staged`] whose texture's refresh is left for
+    /// [`Batch::flush_textures`]: run after it.
+    fn after_textures(&mut self, work: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.after.push(work);
+    }
+
+    /// Whether the refreshes left for later must be done before `step`.
+    ///
+    /// A texture refresh reads title memory, the texture's own lock and
+    /// staging, the write watch's journal and the views' spans; it writes
+    /// only its staging and its own notes. So a step that does not write
+    /// title memory and does not read what a refresh writes may run before
+    /// the refreshes left ahead of it: a refresh of a buffer's copy noted
+    /// for later (it only notes), a fill (title memory into the list's own
+    /// upload memory), another texture's refresh, and a texture's own
+    /// upload work ([`Step::Staged`], which waits for its own texture's
+    /// refresh if that is pending). Every other step waits: a title buffer
+    /// copy and `Run` work write title memory (and end the textures' "due
+    /// once"); `Host` work may read anything; a shader write of a copy's
+    /// range takes a snapshot, kept in order to be safe.
+    fn textures_wait(&self, step: &Step) -> bool {
+        !self.later.is_empty()
+            && !matches!(step, Step::Texture(_) | Step::Refresh(..) | Step::Fill(..) | Step::Staged(..))
+    }
+
+    /// Does the texture refreshes left for later ([`wide_textures`]) on
+    /// the helper threads (`crate::shadow::wide_run`) and this one, then
+    /// the work that waited for them, in recorded order. The frame line's
+    /// "textures" counts the time it took, not the threads' sum.
+    fn flush_textures(&mut self) {
+        if self.later.is_empty() {
+            return;
+        }
+        self.later_keys.clear();
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Ordering::Relaxed);
+        let count = self.later.len() as u64;
+        if self.later.len() == 1 {
+            for staging in self.later.drain(..) {
+                staging.refresh();
+            }
+        } else {
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
+                .later
+                .drain(..)
+                .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+                .collect();
+            crate::shadow::wide_run(jobs);
+        }
+        let us = started.elapsed().as_micros() as u64;
+        let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[2].fetch_sub(summed.saturating_sub(us), Ordering::Relaxed);
+        WIDE_TEXTURES[0].fetch_add(count, Ordering::Relaxed);
+        WIDE_TEXTURES[1].fetch_add(1, Ordering::Relaxed);
+        WIDE_TEXTURES[2].fetch_add(us, Ordering::Relaxed);
+        WIDE_TEXTURES[3].fetch_add(summed, Ordering::Relaxed);
+        for work in self.after.drain(..) {
+            #[cfg(feature = "diagnostics")]
+            let ran = std::time::Instant::now();
+            work();
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Runs, 1);
+                crate::copystat::add(crate::copystat::C::RunUs, ran.elapsed().as_micros() as u64);
+            }
+        }
     }
 
     /// Before a step that writes title memory: pending refreshes are done
@@ -9165,6 +9355,19 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
+            let [wide, flushes, wide_us, threads_us] = [0, 1, 2, 3].map(|i| WIDE_TEXTURES[i].swap(0, Ordering::Relaxed));
+            #[cfg(feature = "diagnostics")]
+            if wide > 0 {
+                tracing::info!(
+                    "texture refreshes on several threads per frame (VICTORY_WIDE_TEXTURES): {:.1} textures in {:.1} flushes, \
+                     {:.1} ms on the submitting thread's clock, {:.1} ms of the threads' time in all",
+                    wide as f64 / frames,
+                    flushes as f64 / frames,
+                    wide_us as f64 / 1000.0 / frames,
+                    threads_us as f64 / 1000.0 / frames
+                );
+            }
+            let _ = (wide, flushes, wide_us, threads_us);
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
                 tracing::info!(
