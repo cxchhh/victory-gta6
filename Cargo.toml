@@ -77,3 +77,12 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# The diagnostics build with link-time optimisation across crates
+# (`cargo build --profile diag-lto -p victory --features diagnostics`):
+# the layer's CPU work per frame (copies, watches, descriptor making) is
+# the frame's critical path.
+[profile.diag-lto]
+inherits = "release"
+lto = "thin"
+codegen-units = 16

@@ -26,6 +26,11 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// `made` as each slot's last finished making left it, read without
+    /// the lock ([`mirror_fast`]): stored after the host slot is written,
+    /// and 0 before a slot is made null, so a reader that finds its key
+    /// here finds the slot made.
+    made_now: Box<[std::sync::atomic::AtomicU64]>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -1131,6 +1136,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            made_now: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1908,6 +1914,7 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
@@ -2499,6 +2506,16 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // The slot made from this very record already: what the locked
+        // path below returns for it, without the lock.
+        if tag == VIEW_TAG
+            && mirror_fast()
+            && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            MIRROR_FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(view);
+        }
         let mut made = locked(&self.made, 4);
         #[cfg(feature = "diagnostics")]
         let held = Held::start(for_draw);
@@ -2510,6 +2527,7 @@ impl HostHeap {
                 #[cfg(feature = "diagnostics")]
                 held.slot_changed();
                 made[index as usize] = 0;
+                self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -2564,6 +2582,7 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
         Some(view)
     }
@@ -3523,6 +3542,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 
 /// Writes of a slot with another view of the placed texture it showed,
 /// since the start: the slot kept showing the old view.
+/// [`HostHeap::mirror`] calls served without the slots' lock since the
+/// start ([`mirror_fast`]).
+pub(crate) static MIRROR_FAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_MIRROR_FAST=1`: [`HostHeap::mirror`] answers a slot already
+/// made from the title's record without taking the slots' lock (in the
+/// world 85% of its calls, and the lock's waits were 180 ms a frame over
+/// the recording threads). Off (unset or 0): every call takes the lock.
+pub(crate) fn mirror_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIRROR_FAST").is_some_and(|v| v == "1"))
+}
+
 pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a slot written with another view of the placed texture it

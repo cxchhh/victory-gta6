@@ -769,8 +769,9 @@ pub(crate) fn tables_line(frames: f64) {
     let changed_ms = changed_ns * changed / 1e6;
     let (keeps, kept_waits, kept_waited) = (l[10], l[11], l[12] / 1e6);
     let (next_waits, next_waited) = (l[13], l[14] / 1e6);
+    let fast = crate::descriptor::host::MIRROR_FAST.swap(0, Ordering::Relaxed) as f64 / frames;
     tracing::info!(
-        "the host heap's locks per frame, all threads: the slots' lock (HostHeap::mirror) taken {mirrors_draw:.0} times for draws \
+        "the host heap's locks per frame, all threads: {fast:.0} calls of HostHeap::mirror found their slot made without the lock          (VICTORY_MIRROR_FAST=1); the slots' lock (HostHeap::mirror) taken {mirrors_draw:.0} times for draws \
          ({changed_draw:.0} found the slot's record changed) and {mirrors_other:.0} times for writes and the pass over copied records \
          ({changed_other:.0} changed); {made_waits:.0} takes found it held and waited {made_waited:.2} ms in all (every wait timed); it \
          was held {same_ns:.0} ns a call where the slot was as it was and {changed_ns:.0} ns where it had changed (one call in 16 timed), \
