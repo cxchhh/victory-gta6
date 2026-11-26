@@ -4147,6 +4147,9 @@ impl Shadow {
         let Some(card) = &self.card else {
             return false;
         };
+        if !crate::lazy::keeping() {
+            return false;
+        }
         if gpu.is_empty() {
             return false;
         }

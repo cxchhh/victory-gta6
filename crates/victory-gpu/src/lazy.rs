@@ -183,7 +183,7 @@ pub(crate) fn on() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_LAZY_BACK").is_some_and(|v| v == "1");
+        let on = std::env::var_os("VICTORY_LAZY_BACK").is_some_and(|v| v == "1" || v == "alt");
         if on {
             tracing::info!(
                 "what shaders wrote into copies in the card's memory goes into title memory when something touches it, not when it comes back (VICTORY_LAZY_BACK=1; at most {} MB kept)",
@@ -192,6 +192,23 @@ pub(crate) fn on() -> bool {
         }
         on
     })
+}
+
+/// Whether a piece landing now may be kept: with [`on`], always, or with
+/// `VICTORY_LAZY_BACK=alt` twenty seconds yes, twenty no, in turn (an A/B
+/// within one run). Pieces kept stay kept and are put in when touched in
+/// either phase: only the keeping of new ones stops.
+pub(crate) fn keeping() -> bool {
+    #[cfg(test)]
+    if FORCE.load(Relaxed) {
+        return true;
+    }
+    static ALT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ALT.get_or_init(|| std::env::var_os("VICTORY_LAZY_BACK").is_some_and(|v| v == "alt")) {
+        crate::host::alternate(3, "VICTORY_LAZY_BACK")
+    } else {
+        on()
+    }
 }
 
 /// The most bytes kept (`VICTORY_LAZY_MB`, 256): past it pieces merge on
