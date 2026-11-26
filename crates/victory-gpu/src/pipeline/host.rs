@@ -607,7 +607,21 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    // (the state too: offline the pair makes a pipeline with the targets its
+                    // pixel shader writes, so what the title's state adds is what is refused)
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        state = %state,
+                        dsv = g.depth_format.0,
+                        targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
+                        samples = g.samples.Count,
+                        sample_mask = g.sample_mask,
+                        depth_bounds,
+                        raster = ?g.rasterizer,
+                        blend = ?g.blend,
+                        "host mesh pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }

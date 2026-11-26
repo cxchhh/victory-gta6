@@ -405,14 +405,26 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
 fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+    lane_regions_of(st, &[])
+}
+
+/// [`lane_regions`], with the way of a branch into a block of `ends` (blocks that only end the
+/// program) left out where the branch has another: the regions of the lanes that are still
+/// running.
+fn lane_regions_of(st: &Structured, ends: &[bool]) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let end = |b: usize| ends.get(b).copied().unwrap_or(false);
     for (b, e) in st.exits.iter().enumerate() {
         match *e {
             LaneExit::Jump(t) => succ[b].push(t),
             LaneExit::Branch { taken, not_taken, .. } => {
-                succ[b].push(taken);
-                succ[b].push(not_taken);
+                if !end(taken) || end(not_taken) {
+                    succ[b].push(taken);
+                }
+                if !end(not_taken) || end(taken) {
+                    succ[b].push(not_taken);
+                }
             }
             LaneExit::End => {}
             LaneExit::Indirect => return None,
@@ -452,6 +464,12 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
+            // Back to the branch itself (a lane loop's exit): the lanes that left do not run it
+            // again, so it is in its own region – though it post-dominates itself.
+            if b == d && strict_regions() {
+                seen[b] = true;
+                continue;
+            }
             if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
                 continue;
             }
@@ -461,6 +479,85 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         regions.push((d, seen));
     }
     Some(regions)
+}
+
+thread_local! {
+    /// See [`with_strict_regions`].
+    static STRICT_REGIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a lane branch that closes a loop is in its own region ([`lane_regions`]): the
+/// lanes that left the loop there do not run its block again, so that block is not one every
+/// lane runs. Always in the wave-wide form ([`with_strict_regions`]), whose group barriers a
+/// thread that left would leave the others waiting at. `VICTORY_WAVE_STRICT_REGIONS=1`: in
+/// every form – then the exact forms of programs whose exchanges or LDS barriers stand in such
+/// a block are refused and they take the next form (9 of the title's compute programs, which
+/// go to an approximate form; their default form may leave a host wave waiting at a barrier
+/// the other host wave of its console wave is not at).
+fn strict_regions() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    STRICT_REGIONS.get() || *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_STRICT_REGIONS").is_some_and(|v| v == "1"))
+}
+
+/// Runs `f` with lane-loop exits in their own regions ([`strict_regions`]).
+pub(super) fn with_strict_regions<R>(f: impl FnOnce() -> R) -> R {
+    let was = STRICT_REGIONS.replace(true);
+    let r = f();
+    STRICT_REGIONS.set(was);
+    r
+}
+
+/// `VICTORY_WAVE_BLOCKS` (with `VICTORY_WAVE_WHY`): per IR block of a wave-wide form, its
+/// offset, whether every lane runs it, and its exit (a diagnostic).
+pub(super) fn dump_blocks(p: &crate::ir::Program, st: &Structured) {
+    let all = all_lane_blocks(st).unwrap_or_default();
+    for (b, e) in st.exits.iter().enumerate() {
+        let off = p.blocks.get(b).map_or(0, |k| k.offset);
+        let lds = p.blocks.get(b).is_some_and(|k| k.insts.iter().any(|i| matches!(i.fields, Fields::Ds { .. })));
+        let kind = match *e {
+            LaneExit::Jump(t) => format!("jump {t}"),
+            LaneExit::Branch { when, taken, not_taken } => {
+                let uniform = st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)));
+                format!(
+                    "branch {taken}/{not_taken}{}{}",
+                    if st.wide.contains(&b) { " WIDE" } else { "" },
+                    if uniform { " uniform" } else { "" }
+                )
+            }
+            LaneExit::End => "end".into(),
+            LaneExit::Indirect => "indirect".into(),
+        };
+        eprintln!(
+            "WAVE64-BLOCK {b} @{off:#x} all={} lds={lds} {kind}",
+            all.get(b).copied().unwrap_or(false)
+        );
+    }
+}
+
+/// The blocks holding a title barrier (`s_barrier`, which waits for the whole group,
+/// [`super::group_sync`] 2) that a thread still running may not reach: those in the region of a
+/// per-lane branch, the lanes that end the program aside (a thread that has ended is not
+/// waited for). Empty with an indirect exit (not followed) or barriers that do not wait.
+pub(super) fn barriers_skipped(p: &crate::ir::Program, st: &Structured) -> Vec<usize> {
+    if super::group_sync() != 2 {
+        return Vec::new();
+    }
+    let n = st.exits.len().min(p.blocks.len());
+    let has = |b: usize| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier");
+    if !(0..n).any(has) {
+        return Vec::new();
+    }
+    let ends: Vec<bool> = (0..st.exits.len())
+        .map(|b| {
+            b < p.blocks.len()
+                && matches!(st.exits[b], LaneExit::End)
+                && p.blocks[b].insts.iter().all(|i| matches!(i.fields, Fields::Sopp { .. }))
+        })
+        .collect();
+    let Some(regions) = lane_regions_of(st, &ends) else {
+        return Vec::new();
+    };
+    (0..n).filter(|&b| has(b) && regions.iter().any(|(_, r)| r[b])).collect()
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
@@ -1077,7 +1174,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    if (0..n).any(|r| reads[r] && writes[r]) && !barrier_ordered(p, st, all) {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -1093,6 +1190,65 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     Some(meet)
+}
+
+/// Whether the title's own barriers keep the order of the LDS accesses inside the regions of
+/// blocks not every lane runs (`all` is [`all_lane_blocks`]): no path inside a region goes from
+/// a write to a read, or from a read to a write, without an `s_barrier` between them. Such a
+/// barrier is a group barrier on the host (every barrier waits, [`super::group_sync`] 2), which
+/// both host waves of a console wave meet at, so it orders their accesses as the console's
+/// lock step does. (The title puts one there when the write and the read are of different
+/// console waves of the group.) A region is entered from blocks all lanes run, where
+/// [`lds_meetings`] puts a barrier, so it starts with nothing to order.
+fn barrier_ordered(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> bool {
+    if super::group_sync() != 2 {
+        return false;
+    }
+    let n = st.exits.len().min(p.blocks.len());
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    // per block: (a write, a read) since the last barrier on some path into it
+    let mut into = vec![(false, false); n];
+    let mut work: Vec<usize> = (0..n).filter(|&b| !all[b]).collect();
+    while let Some(b) = work.pop() {
+        let (mut w, mut r) = into[b];
+        for i in &p.blocks[b].insts {
+            let name = i.name();
+            if name == "s_barrier" {
+                (w, r) = (false, false);
+                continue;
+            }
+            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
+                continue;
+            }
+            if name.starts_with("ds_read") {
+                if w {
+                    return false;
+                }
+                r = true;
+            } else {
+                if r {
+                    return false;
+                }
+                w = true;
+            }
+        }
+        for t in succ(b) {
+            if t < n && !all[t] {
+                let next = (into[t].0 | w, into[t].1 | r);
+                if next != into[t] {
+                    into[t] = next;
+                    work.push(t);
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its

@@ -220,14 +220,19 @@ fn deep_skips_not(c: &Container) -> bool {
 }
 
 /// Whether the wave-wide form is kept from this program even with
-/// `VICTORY_WAVE_WIDE=1`: `VICTORY_WAVE_WIDE_NOT=<name part>,...`, by default
+/// `VICTORY_WAVE_WIDE=1` or `last`: `VICTORY_WAVE_WIDE_NOT=<name part>,...`, by default
 /// the particle light atlas programs (`ptfx_CS_lightAtlas`), which lost the
-/// card in that form (runs 121-124). Set empty, none is kept from it.
+/// card in that form (runs 121-124), and the particle emitters of models
+/// (`CS_Emit_Dynamic_Model`, 6 programs), whose form branches around 5 group
+/// barriers on a first-lane read of a value that may differ between lanes: the
+/// two host waves of a console wave read their own first lanes and could go
+/// different ways (not run; found by a check of the emitted code). Set empty,
+/// none is kept from it.
 fn wide_not(c: &Container) -> bool {
     static NOT: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
     let not = NOT.get_or_init(|| {
         std::env::var("VICTORY_WAVE_WIDE_NOT")
-            .unwrap_or_else(|_| "ptfx_CS_lightAtlas".to_owned())
+            .unwrap_or_else(|_| "ptfx_CS_lightAtlas,CS_Emit_Dynamic_Model".to_owned())
             .split(',')
             .map(str::trim)
             .filter(|n| !n.is_empty())
@@ -589,6 +594,12 @@ pub fn emit(
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        if why {
+            match &original {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY as is: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-RETRY as is: {e}"),
+            }
+        }
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if matches!(r, Ok((_, wave)) if *wave != Some(64)) {
                 CHOSEN.with(|c| *c.borrow_mut() = what.to_owned());
@@ -622,10 +633,15 @@ pub fn emit(
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
         let form = |p: Option<ir::Program>| {
+            if why && p.is_none() {
+                eprintln!("WAVE64-FORM not made: nothing to leave out");
+            }
             p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
-                let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+                let st = structure::structure(&p).inspect_err(|e| if why { eprintln!("WAVE64-FORM not structured: {e}") }).ok()?;
+                let io = io::raise(&p, native).inspect_err(|e| if why { eprintln!("WAVE64-FORM I/O: {e}") }).ok()?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                    .inspect_err(|e| if why { eprintln!("WAVE64-FORM resources: {e}") })
+                    .ok()?;
                 Some((p, st, io, res))
             })
         };
@@ -648,6 +664,10 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") && !wide_not(c);
+        // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
+        // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
+        // the programs the approximate forms already take keep their barrier-free form.
+        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -731,6 +751,23 @@ pub fn emit(
                 }
             }
         }
+        if wide_last {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -802,10 +839,33 @@ fn widen(
     p: &ir::Program,
     why: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    // (a block closing a lane loop is not one every lane runs: the group barriers of this form
+    // must not stand there)
+    lower::with_strict_regions(|| widen_strict(c, native, p, why))
+}
+
+fn widen_strict(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    why: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
         what: "wave-wide branches in a thread group of several console waves",
     };
+    // a console wave run as two host waves: the form puts group barriers in branches and loops
+    let halves = native.wave64 && lower::host_max_wave() == 32;
+    // (whichever switch asked for it, `1` or `last`: the programs that lost the card in it)
+    if halves && wide_not(c) {
+        if why {
+            eprintln!("WAVE64-WIDE not tried: VICTORY_WAVE_WIDE_NOT names the program");
+        }
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "wave-wide branches in a program VICTORY_WAVE_WIDE_NOT names",
+        });
+    }
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
@@ -825,18 +885,30 @@ fn widen(
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
         let r = emit_program(c, native, p, &st, &io, &res);
-        let needs = lower::take_needs();
+        let mut needs = lower::take_needs();
+        // The title's own barriers (every one waits for the group, `group_sync`) in blocks a
+        // thread that is still running may not reach (a lane loop some lanes leave early, a
+        // lane branch around it; a lane that ends the program is not waited for): on the
+        // console the wave reaches it with those lanes off, on the host the other threads
+        // would wait for them for ever. The branches around them are taken wave-wide too;
+        // where one cannot be, the form is refused.
+        let skipped = if halves { lower::barriers_skipped(p, &st) } else { Vec::new() };
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
-            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty()
+            || r.is_ok() && !skipped.is_empty();
         if !stuck {
             if why {
                 eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
+                if std::env::var_os("VICTORY_WAVE_BLOCKS").is_some() {
+                    lower::dump_blocks(p, &st);
+                }
             }
             return r;
         }
+        needs.extend(skipped.iter().copied());
         let more: Vec<usize> = lower::branches_around(&st, &needs)
             .unwrap_or_default()
             .into_iter()
@@ -845,6 +917,15 @@ fn widen(
         if more.is_empty() {
             if why {
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
+            }
+            if !skipped.is_empty() {
+                if why {
+                    eprintln!("WAVE64-WIDE refused: title barriers in blocks {skipped:?} a running thread may not reach");
+                }
+                return Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: "a group barrier a running thread may not reach (wave-wide branches)",
+                });
             }
             return r;
         }
