@@ -50,8 +50,8 @@ constants an earlier, not yet executed submission still had to read.
 |---|---|---|---|
 | 0 census | `VICTORY_FLAT=census` | try-flat 10b86ef4, merged | numbers above |
 | 1 lazy copy-back (pieces kept, title pages `PAGE_NOACCESS`, merged on touch) | `VICTORY_LAZY_BACK=1`/`alt` | try-lazy, merged | works (faults: 0.3 MB a frame) but no gain: lazy1 186.9 ms off, 200.3 ms on; only a third of pieces qualify (view memory is excluded) and the fetch and compare stay. Its fault machinery is reused by 2b. Off. |
-| 2 flat mirror, CPU to card | `VICTORY_FLAT=1` | try-flat | in progress (2 GiB windows: WARP fails mapping past ~2 GiB) |
-| 2b GPU writes stay on the card | | | to do |
+| 2 flat mirror, CPU to card | `VICTORY_FLAT=1` | try-flat f008cfbd | correct (replay 0 wrong; game run flat1 fine with 11 windows of 2 GiB) but slower: 198.6 ms against 178.9 off (prof3, same exe), card 58 against 40 ms. Only reads go there and pages shaders write leave it, so it serves 18% of asks (415k a frame fall back as shader-written, 83k unaligned, 19k without tiles; 1.5 GB of tiles used up at once); its upload costs 28.6 ms a frame (65 MB, a page at a time). Kept off; 2b is what makes it pay. |
+| 2b GPU writes stay in the mirror | `VICTORY_FLAT=2` | try-flat | in progress: written pages stay, title pages guarded, a CPU touch waits for the fence and downloads the page on a copy queue; upload by run, not by page |
 | 3 constants in the mirror | `VICTORY_FLAT_CBV=1` | | to do |
 | 4 views made once, flat shader addressing | `VICTORY_FLAT_VIEWS=1` | | to do |
 
@@ -65,6 +65,12 @@ Tried and dropped (numbers in the commits): a copy's refresh skipping bytes it s
 itself (keep1, 201 ms vs 194), merge-run cap 65,536 (fill2, +26 ms on the card),
 `CARD_STEPS` (steps1, 219 ms), thin LTO and `target-cpu=native` (replay: under 1%; the
 CPU time is system calls, copies and locks, not code generation).
+
+Also measured (prof3, current base, world, standing): the frame is serial, about 100 ms
+preparing on the submitting thread, 40-47 ms on the card and 30 ms copying back, so no change of
+a sync point helps on its own: presents put behind the line (`VICTORY_ASYNC_PRESENT=alt`,
+apres1) went 182.6 -> 196.4 ms; the title then waits on its fence instead. Stage 5 (GPU detile,
+branch try-detile) runs beside 2b because the CPU detile is on that same submitting thread.
 
 ## How each stage is checked
 
