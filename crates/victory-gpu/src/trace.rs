@@ -455,17 +455,47 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
                             out.no_copy
                         );
                     }
-                    if verify {
+                    // One submission in `VICTORY_TRACE_VERIFY_EVERY` (25): the
+                    // asked ranges joined copy by copy, each compared once.
+                    let every = std::env::var("VICTORY_TRACE_VERIFY_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(25u64).max(1);
+                    if verify && out.submissions % every == 0 {
+                        let mut by_copy: HashMap<u64, (std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)> = HashMap::new();
                         for (_, ranges) in &taken {
                             for &(a, n) in ranges {
                                 let Some(shadow) = crate::shadow::find(a, n) else { continue };
-                                match shadow.cpu_side(a, n).filter(|side| inside(a, side.len() as u64)) {
+                                let (start, len) = shadow.span();
+                                let (from, to) = (a.max(start), (a + n.max(1)).min(start + len));
+                                if from < to {
+                                    by_copy.entry(shadow.id()).or_insert_with(|| (shadow.clone(), Vec::new())).1.push((from, to));
+                                }
+                            }
+                        }
+                        for (shadow, mut spans) in by_copy.into_values() {
+                            spans.sort_unstable();
+                            let mut joined: Vec<(u64, u64)> = Vec::new();
+                            for (a, b) in spans {
+                                match joined.last_mut() {
+                                    Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                                    _ => joined.push((a, b)),
+                                }
+                            }
+                            for (a, b) in joined {
+                                match shadow.cpu_side(a, b - a).filter(|side| inside(a, side.len() as u64)) {
                                     Some(side) => {
                                         out.checked += 1;
                                         // SAFETY: mapped title memory of the replay.
                                         let title = unsafe { std::slice::from_raw_parts(a as *const u8, side.len()) };
                                         if title != side {
                                             out.wrong += 1;
+                                            if out.wrong <= 5 {
+                                                let at = title.iter().zip(side).position(|(x, y)| x != y).unwrap_or(0);
+                                                eprintln!(
+                                                    "replay: WRONG after submission {}: copy {} [{a:#x}, {b:#x}) first differs at {:#x}",
+                                                    out.submissions,
+                                                    shadow.id(),
+                                                    a + at as u64
+                                                );
+                                            }
                                         }
                                     }
                                     None => out.unchecked += 1,
