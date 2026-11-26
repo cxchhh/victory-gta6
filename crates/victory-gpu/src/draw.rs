@@ -970,6 +970,37 @@ pub(crate) static CBV_NOT_IN_PLACE: AtomicU64 = AtomicU64::new(0);
 /// Slots of the tables of constant buffers made for split tables, since
 /// the start (`State::cbv_table`).
 pub(crate) static CBV_SPLIT_SLOTS: AtomicU64 = AtomicU64::new(0);
+/// Of those, constant buffers made in place over their host copy
+/// ([`cbv_split_in_place`]), since the start.
+pub(crate) static CBV_SPLIT_IN_PLACE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a split table's constant buffers are views over their host copy
+/// (`VICTORY_CBV_SPLIT_IN_PLACE=1`, with `VICTORY_CBV_IN_PLACE=1` for the
+/// shaders' rows; off by default) instead of copies made in the list's
+/// upload memory when it is submitted.
+///
+/// Why: those copies are the fills of upload memory, 10,000 to 19,000 a
+/// frame in the world (cbv3), almost all of the submitting thread's
+/// "lists' steps" (47 to 98 ms a frame), each a step to look up, check
+/// against flights and copy. The title's constants are a ring it writes
+/// anew every frame at new places, so its views are never stable and the
+/// title slots' own in-place views (`HostHeap::cbv_stable`) never take
+/// them. A split table's view is in a dynamic slot of this draw alone, so
+/// nothing rewrites it while a list that names it waits to run: the view
+/// can point into the host copy itself. Its bytes are brought up to date
+/// in the list (`Shadow::refresh`) at submission, when the fill read them;
+/// the title does not write a ring's constants again before the card is
+/// done with them, as on the console, where the card reads them in place.
+///
+/// NOT FOR USE: cbv4 (with `VICTORY_CBV_IN_PLACE=1`) drew the start screens
+/// black, 6,131 views made in place a frame. Not found yet why (suspects: the
+/// shaders' rows for dynamic slots, the ring's pages refreshed in time).
+fn cbv_split_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CBV_SPLIT_IN_PLACE").is_some_and(|v| v == "1") && victory_shader::emit::cbv_in_place()
+    })
+}
 /// Frames a constant buffer view must have stayed in its title slot to be
 /// made in place (`HostHeap::cbv_stable`).
 const CBV_STABLE_FRAMES: u32 = 120;
@@ -3497,6 +3528,16 @@ impl State {
             let index = first + j as u32;
             match crate::descriptor::view(table + u64::from(k) * 32) {
                 Some(View::Constant(address, size)) => {
+                    // In place over the host copy (`cbv_split_in_place`): no
+                    // copy of the constants at submission.
+                    if cbv_split_in_place()
+                        && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                        && host.constant_in_place(index, address, size)
+                    {
+                        shadow.refresh(list, address, u64::from(size));
+                        CBV_SPLIT_IN_PLACE.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                         host.make_null(index);
                         continue;

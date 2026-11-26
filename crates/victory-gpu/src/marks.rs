@@ -214,6 +214,7 @@ fn log(last: &[AtomicU32], now: u32) {
         back = crate::draw::VIEW_MARKS_BACK.load(Relaxed),
         cbv_not_in_place = crate::draw::CBV_NOT_IN_PLACE.load(Relaxed),
         cbv_split_slots = crate::draw::CBV_SPLIT_SLOTS.load(Relaxed),
+        cbv_split_in_place = crate::draw::CBV_SPLIT_IN_PLACE.load(Relaxed),
         "view marks: slots the shaders read; texture views made null for room, and made again when read"
     );
 }

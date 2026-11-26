@@ -2305,6 +2305,38 @@ impl HostHeap {
         };
     }
 
+    /// A constant buffer view at dynamic slot `index` over the host copy of
+    /// title memory `[address, address + size)` itself, not a copy of it
+    /// in upload memory: at the 256-byte boundary at or below, with the
+    /// rows between noted for the shaders (`SLOT_CBV_ROWS`, as
+    /// [`HostHeap::note_rows`] does for the title's slots). False if no
+    /// host copy holds the range or the rows table is missing; the caller
+    /// then fills a copy as before. The caller brings the range up to date
+    /// in the list (`Shadow::refresh`).
+    pub(crate) fn constant_in_place(&self, index: u32, address: u64, size: u32) -> bool {
+        let Some((_, _, data)) = &self.cbv_rows else { return false };
+        if index >= self.count + self.dynamic {
+            return false;
+        }
+        let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+            return false;
+        };
+        let Some(host) = host() else { return false };
+        let gpu = shadow.gpu(address);
+        let early = gpu % 256;
+        // SAFETY: inside the rows table's mapping; a dword the GPU reads whole.
+        unsafe { (*data as *mut u32).add(index as usize).write_volatile((early / 16) as u32) };
+        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu - early,
+            SizeInBytes: constant_view_size(size.saturating_add(early as u32)),
+        };
+        // SAFETY: a slot of our heap; the range lies in the host copy, which
+        // the slot keeps alive.
+        unsafe { host.device.CreateConstantBufferView(Some(&desc), self.cpu(index)) };
+        self.keep(index, Some(shadow.buffer.clone()));
+        true
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
