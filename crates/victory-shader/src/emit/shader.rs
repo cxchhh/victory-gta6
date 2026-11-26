@@ -94,14 +94,18 @@ pub const SLOT_MARKS: u8 = 251;
 /// ([`Shader::cbuffer_row`]). Tables holding constant buffers then need no
 /// copy made afresh for every draw (the dynamic slots, 262,144 on NVIDIA,
 /// ran out: 1,500 tables a frame and their draws dropped, run mk1).
-/// `VICTORY_CBV_IN_PLACE=0`: as before.
+/// Off unless `VICTORY_CBV_IN_PLACE=1`: the title writes most of its
+/// constant buffer views anew every frame (29,000 of a frame's views were
+/// still copied with it on), tables without slots fell only from 1,580 to
+/// 679 a frame, and both runs with it on logged a driver error (cbv1 lost
+/// the card with every view in place; cbv2, stable views only, did not).
 pub const SLOT_CBV_ROWS: u8 = 250;
 
 /// Whether constant buffer views picked from the heap take their rows from
 /// the host's table ([`SLOT_CBV_ROWS`]).
 pub fn cbv_in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_IN_PLACE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_IN_PLACE").is_some_and(|v| v == "1"))
 }
 
 /// Whether shaders mark the views they read ([`SLOT_MARKS`]).
