@@ -58,6 +58,16 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: per slot, the rows (16 bytes) by which the constant
+    /// buffer view there begins past its host view, which starts at the
+    /// 256-byte boundary at or below the title's address
+    /// (`victory_shader::emit::SLOT_CBV_ROWS`): buffer, GPU address, mapping.
+    cbv_rows: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps, per title slot: the record (key) a draw last found there
+    /// when asking whether a constant buffer view may be made in place, and
+    /// the frame (plus one) from which it has held it
+    /// ([`HostHeap::cbv_stable`]).
+    cbv_seen: Vec<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU32)>,
     /// View heaps: the title address of the buffer view at each title slot,
     /// two dwords per slot, for shaders that read a descriptor's address out
     /// of a table at an index they compute
@@ -1074,6 +1084,19 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        let cbv_rows = (!sampler)
+            .then(|| {
+                let bytes = u64::from(size) * 4;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "constant buffer rows by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let strides = (!sampler)
             .then(|| {
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_DWORDS) * 4;
@@ -1114,6 +1137,10 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            cbv_rows,
+            cbv_seen: (0..if sampler { 0 } else { count })
+                .map(|_| (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU32::new(0)))
+                .collect(),
             views,
             buffers: Mutex::default(),
             changed: Mutex::default(),
@@ -1400,6 +1427,59 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The GPU address of the table of constant buffer rows by slot
+    /// (`victory_shader::emit::SLOT_CBV_ROWS`), and its buffer.
+    pub(crate) fn cbv_rows_gpu(&self) -> Option<u64> {
+        self.cbv_rows.as_ref().map(|s| s.1)
+    }
+    pub(crate) fn cbv_rows_buffer(&self) -> Option<&ID3D12Resource> {
+        self.cbv_rows.as_ref().map(|s| &s.0)
+    }
+
+    /// Whether the record at title slot `index` (in title memory at
+    /// `handle`) has stayed the same for `frames` frames, as seen by the
+    /// draws that asked: a constant buffer view there is then made in the
+    /// title's slot, which every list reads (`victory_shader::emit::
+    /// SLOT_CBV_ROWS`). One the title writes anew within that span (the
+    /// constants of a frame, in a ring) is copied into a table of the
+    /// draw's own as before: a host slot rewritten while lists recorded
+    /// earlier have yet to run would give them the new view (run cbv1: the
+    /// card hung two minutes in, every constant buffer view in place).
+    pub(crate) fn cbv_stable(&self, index: u32, handle: u64, frames: u32) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some((seen, since)) = self.cbv_seen.get(index as usize) else {
+            return false;
+        };
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [_, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        let now = crate::frame::current() as u32;
+        if seen.swap(key, Relaxed) != key {
+            since.store(now.wrapping_add(1), Relaxed);
+            return false;
+        }
+        let from = since.load(Relaxed);
+        from != 0 && now.wrapping_add(1).wrapping_sub(from) >= frames
+    }
+
+    /// Notes for slot `index` the rows its constant buffer view begins past
+    /// its host view ([`make`] makes it at the 256-byte boundary at or
+    /// below); 0 for any other view, or one made elsewhere.
+    fn note_rows(&self, index: u32, view: &View) {
+        let Some((_, _, data)) = &self.cbv_rows else { return };
+        if index >= self.count + self.dynamic {
+            return;
+        }
+        let rows = match view {
+            &View::Constant(address, size) => crate::shadow::find(address, u64::from(size))
+                .map_or(0, |shadow| (shadow.gpu(address) % 256 / 16) as u32),
+            _ => 0,
+        };
+        // SAFETY: inside the mapping of `size` dwords; a dword store the
+        // GPU reads as a whole.
+        unsafe { (*data as *mut u32).add(index as usize).write_volatile(rows) };
     }
 
     /// The GPU address of the table of view addresses by title slot.
@@ -2067,6 +2147,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        self.note_rows(index, view);
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
@@ -2205,6 +2286,13 @@ impl HostHeap {
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
+        // (A copy of the constants in upload memory, 256-byte aligned.)
+        if let Some((_, _, data)) = &self.cbv_rows
+            && index < self.count + self.dynamic
+        {
+            // SAFETY: as in `note_rows`.
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(0) };
+        }
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -2434,6 +2522,7 @@ impl HostHeap {
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
+            self.note_rows(index, &view);
             let kept = if later {
                 None
             } else {
@@ -3208,7 +3297,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
+            // The host wants 256-byte alignment, the console 16: the view
+            // begins at the boundary at or below, and shaders add the rows
+            // between (`victory_shader::emit::SLOT_CBV_ROWS`,
+            // `HostHeap::note_rows`).
+            let early = gpu % 256;
+            if early != 0 && !victory_shader::emit::cbv_in_place() {
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
@@ -3216,8 +3310,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 return None;
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: constant_view_size(size),
+                BufferLocation: gpu - early,
+                SizeInBytes: constant_view_size(size.saturating_add(early as u32)),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };

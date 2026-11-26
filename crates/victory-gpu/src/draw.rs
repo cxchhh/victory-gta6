@@ -898,6 +898,12 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// card full, and ones made again because a shader then read them, since
 /// the start (`crate::marks`, `HostHeap::evict_unmarked`).
 pub(crate) static VIEW_MARKS_EVICTED: AtomicU64 = AtomicU64::new(0);
+/// Constant buffer views of tables that could not be made in place (no host
+/// copy of their memory): their table was made afresh, since the start.
+pub(crate) static CBV_NOT_IN_PLACE: AtomicU64 = AtomicU64::new(0);
+/// Frames a constant buffer view must have stayed in its title slot to be
+/// made in place (`HostHeap::cbv_stable`).
+const CBV_STABLE_FRAMES: u32 = 120;
 pub(crate) static VIEW_MARKS_BACK: AtomicU64 = AtomicU64::new(0);
 /// Since the start: looks at a slot uploaded in part that found no more of
 /// its memory mapped; uploads of textures not all mapped; and of those,
@@ -1562,6 +1568,39 @@ impl State {
                                 } else {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
                                 }
+                            }
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_CBV_ROWS {
+                        // Ours: the rows each constant buffer view of the
+                        // heap begins past its host view.
+                        let table = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host())
+                            .and_then(|host| {
+                                if let Some(buffer) = host.cbv_rows_buffer() {
+                                    list.keep(buffer);
+                                }
+                                host.cbv_rows_gpu()
+                            });
+                        match table {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => {
+                                once!("a shader reads constant buffers of a view heap that is not set");
+                                return false;
                             }
                         }
                         continue;
@@ -3346,6 +3385,14 @@ impl State {
         #[cfg(feature = "diagnostics")]
         tally(19, 1);
         if let Some(view) = host.mirror(index, handle, true) {
+            // A constant buffer view made in place reads the host copy of
+            // title memory: brought up to date for this list, as a root
+            // view is (`root_view`).
+            if let View::Constant(address, size) = view
+                && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+            {
+                shadow.refresh(list, address, u64::from(size));
+            }
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -3373,10 +3420,46 @@ impl State {
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        // (With constant buffer views made in place, the shaders adding the
+        // rows the host's view begins early by: no longer for them.)
+        let in_place = victory_shader::emit::cbv_in_place();
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| {
+                u.kind == ResourceType::Cbv
+                    && (!in_place || {
+                        // In place only over memory the host keeps a copy
+                        // of; a table with a constant buffer elsewhere is
+                        // made afresh as before (its data copied from
+                        // title memory at submission).
+                        // And only a view the title has left in its slot
+                        // for `CBV_STABLE_FRAMES` frames (`cbv_stable`).
+                        let shadowed = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                            Some(&Root::Table(table)) => {
+                                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                                let stable = self.heap_of(handle).is_some_and(|heap| {
+                                    match (heap.host(), heap.index(handle)) {
+                                        (Some(host), Some(index)) => host.cbv_stable(index, handle, CBV_STABLE_FRAMES),
+                                        _ => false,
+                                    }
+                                });
+                                stable
+                                    && match crate::descriptor::view(handle) {
+                                        Some(View::Constant(address, size)) => {
+                                            crate::shadow::find(address, u64::from(size)).is_some()
+                                        }
+                                        _ => true,
+                                    }
+                            }
+                            _ => true,
+                        };
+                        if !shadowed {
+                            CBV_NOT_IN_PLACE.fetch_add(1, Ordering::Relaxed);
+                        }
+                        !shadowed
+                    })
+            })
             .map(|u| u.slot)
             .collect();
         // Tables reaching past a host heap smaller than the title's (the

@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Bin, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -83,6 +83,26 @@ pub const MEMORY_FAULTS: u32 = 4096;
 /// shaders that read it, not for every view the title's 720,000-slot heap
 /// names (`victory-gpu` `marks.rs`). `VICTORY_VIEW_MARKS=0`: none.
 pub const SLOT_MARKS: u8 = 251;
+
+/// The root SRV `t<SLOT_CBV_ROWS>` in [`ROOT_CBV_SPACE`]: a raw buffer the
+/// host keeps, dword `i` the rows (16 bytes) by which the constant buffer
+/// view at view-heap slot `i` begins past the host's view of it. The
+/// console wants constant buffers 16-byte aligned, the host 256: the host
+/// makes the view at the 256-byte boundary at or below the title's address,
+/// in the title's own slot, and a shader that reads a constant buffer it
+/// picks from the heap adds these rows to every row it reads
+/// ([`Shader::cbuffer_row`]). Tables holding constant buffers then need no
+/// copy made afresh for every draw (the dynamic slots, 262,144 on NVIDIA,
+/// ran out: 1,500 tables a frame and their draws dropped, run mk1).
+/// `VICTORY_CBV_IN_PLACE=0`: as before.
+pub const SLOT_CBV_ROWS: u8 = 250;
+
+/// Whether constant buffer views picked from the heap take their rows from
+/// the host's table ([`SLOT_CBV_ROWS`]).
+pub fn cbv_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_IN_PLACE").is_none_or(|v| v != "0"))
+}
 
 /// Whether shaders mark the views they read ([`SLOT_MARKS`]).
 pub fn view_marks() -> bool {
@@ -206,6 +226,10 @@ pub(crate) struct Shader {
     /// already marked.
     pub marks: u32,
     marked: std::collections::HashSet<(usize, V)>,
+    /// Constant buffer handles picked from the heap, with their slot
+    /// ([`SLOT_CBV_ROWS`]), and the rows read per (block, slot).
+    cbv_slots: std::collections::HashMap<V, V>,
+    cbv_rows: std::collections::HashMap<(usize, V), V>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -265,6 +289,8 @@ impl Shader {
             nonuniform_handles: 0,
             marks: 0,
             marked: std::collections::HashSet::new(),
+            cbv_slots: std::collections::HashMap::new(),
+            cbv_rows: std::collections::HashMap::new(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -542,7 +568,47 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        // A constant buffer view (kind 13): its rows begin where the host's
+        // table says ([`SLOT_CBV_ROWS`]).
+        if !sampler && props.0 == 13 && limit != 0 && cbv_in_place() {
+            self.cbv_slots.insert(h, index);
+        }
+        h
+    }
+
+    /// Row `row` of the constant buffer `h` as the host holds it: for a
+    /// view picked from the heap, `row` plus the rows its host view begins
+    /// early by ([`SLOT_CBV_ROWS`]); any other row as it is.
+    pub fn cbuffer_row(&mut self, block: usize, h: V, row: V) -> V {
+        let Some(&slot) = self.cbv_slots.get(&h) else {
+            return row;
+        };
+        let rows = match self.cbv_rows.get(&(block, slot)) {
+            Some(&r) => r,
+            None => {
+                let table = self.root_srv_handle(SLOT_CBV_ROWS);
+                let two = self.m.i32(2);
+                let byte = self.m.bin(block, Bin::Shl, slot, two);
+                let i32t = self.t.i32;
+                let undef = self.m.undef(i32t);
+                let (mask, align) = (self.m.i8(1), self.m.i32(4));
+                let res = self.t.res_ret;
+                let r = self.op(
+                    block,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    res,
+                    139,
+                    &[table, byte, undef, mask, align],
+                );
+                let f = self.m.extract(block, r, 0);
+                let r = self.m.cast(block, Cast::Bitcast, f, i32t);
+                self.cbv_rows.insert((block, slot), r);
+                r
+            }
+        };
+        self.m.bin(block, Bin::Add, row, rows)
     }
 
     /// Stores the mark of the view at heap slot `index` ([`SLOT_MARKS`]),
