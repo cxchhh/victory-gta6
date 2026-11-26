@@ -62,3 +62,26 @@ pub use windows::{
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 /// `DLL_PROCESS_DETACH`.
 pub const DLL_PROCESS_DETACH: u32 = 0;
+
+/// Writes `bytes` over the mapped image at `at`, making only the pages they
+/// lie on writable for the copy and putting their protection back after.
+///
+/// # Safety
+///
+/// `at .. at + bytes.len()` lies inside an image mapped in this process,
+/// which no other thread runs or reads while it is written.
+#[cfg(windows)]
+pub unsafe fn patch_image(at: usize, bytes: &[u8]) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    let mut before = 0u32;
+    // SAFETY: the caller's contract; the old protection is restored below.
+    unsafe {
+        if VirtualProtect(at as *const _, bytes.len(), PAGE_EXECUTE_READWRITE, &mut before) == 0 {
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+        let mut was = 0u32;
+        VirtualProtect(at as *const _, bytes.len(), before, &mut was);
+    }
+    true
+}

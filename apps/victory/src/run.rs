@@ -38,6 +38,8 @@ pub fn run(
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    #[cfg(windows)]
+    cap_resolution(image.base() as usize, image.info().size_of_image as usize);
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -341,4 +343,38 @@ mod tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// `VICTORY_RESOLUTION=<w>x<h>` (1920x1080 at the least): caps the title's
+/// resolution ladder at that size, so it renders and presents for the
+/// display instead of the console's 4K, and turns the pool-offset
+/// self-check the cap trips into a `nop` (`victory_game::output`). Before
+/// the title runs and before its image is write-watched.
+#[cfg(windows)]
+fn cap_resolution(base: usize, size: usize) {
+    let Some((width, height)) = victory_game::output::requested() else {
+        return;
+    };
+    // SAFETY: the image is mapped for `size` bytes and nothing runs it yet.
+    let image = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
+    let Some(at) = victory_game::output::ladder_at(image) else {
+        println!("resolution     no resolution ladder in this build: {width}x{height} not applied");
+        return;
+    };
+    let site = victory_game::output::assert_site(image);
+    let (ladder, changed) = victory_game::output::capped_ladder(width, height);
+    // SAFETY: inside the mapped image, before the title runs.
+    if !unsafe { victory_loader::patch_image(base + at, &ladder) } {
+        eprintln!("resolution     the ladder could not be made writable: {width}x{height} not applied");
+        return;
+    }
+    println!("resolution     {changed} ladder entries capped to {width}x{height}");
+    match site {
+        // SAFETY: as above.
+        Some(int3) if unsafe { victory_loader::patch_image(base + int3, &[0x90]) } => {
+            println!("resolution     the pool-offset self-check's int3 at {:#x} is a nop", base + int3);
+        }
+        Some(_) => eprintln!("resolution     the self-check's int3 could not be patched"),
+        None => println!("resolution     no pool-offset self-check found in this build"),
+    }
 }
