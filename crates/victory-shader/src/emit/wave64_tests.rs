@@ -23,6 +23,12 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// `skip`: the branch past the body when no thread is below s0: `s_cbranch_execz`, or
 /// `s_cbranch_scc0` on the SCC `s_and_saveexec` sets ("some lane is left").
 fn program(skip: u32) -> NativeProgram {
+    program_with(skip, &super::wave::WAVE_OR_V7_TO_S7)
+}
+
+/// [`program`] with `wave_or` (20 words, as [`super::wave::WAVE_OR_V7_TO_S7`]: the branch past
+/// it keeps its length) as the wave OR into s7.
+fn program_with(skip: u32, wave_or: &[u32; 20]) -> NativeProgram {
     let mut words = vec![
         0x7E0A_0281, // v_mov_b32 v5, 1
         0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
@@ -31,7 +37,7 @@ fn program(skip: u32) -> NativeProgram {
         0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
         skip | 23,   // the branch to the restore of EXEC
     ];
-    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(wave_or);
     words.extend_from_slice(&[
         0x7E00_0207, // v_mov_b32 v0, s7
         0x38 << 26 | 0x1C << 18,
@@ -361,7 +367,11 @@ fn a_wave_or_inside_a_lane_branch_needs_the_branch_wave_wide() {
 }
 
 fn a_wave_or_inside(skip: u32, name: &str) {
-    let native = program(skip);
+    a_wave_or_inside_of(program(skip), name);
+}
+
+/// [`a_wave_or_inside`] for `native`, a [`program_with`] whose branch past the body is `name`.
+fn a_wave_or_inside_of(native: NativeProgram, name: &str) {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let branch = (0..p.blocks.len())
         .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == name))
@@ -1218,6 +1228,86 @@ fn paired_lanes_or_a_wave_inside_a_lane_branch() {
         }
     }
     eprintln!("ran on the hardware device: the OR of both halves in every case");
+}
+
+/// [`super::wave::WAVE_OR_V7_TO_S7`] with its last `v_readlane_b32` past the restore of EXEC: a
+/// readlane at a constant lane right after the restore belongs to the section
+/// ([`super::wave::Section::after`]). `lane` 0 reads lane 0 of the full OR, as before but after
+/// the restore. `lane` 63 is how the title's wave64 reductions end: the halves are joined with
+/// lane 31's value (the upper half takes the lower's OR) and lane 63 is read after the restore.
+/// The same 20 words, so the branch past the OR in [`program_with`] keeps its length. On the
+/// console `v_readlane_b32` does not look at EXEC: s7 is the wave's OR either way.
+fn wave_or_read_past_the_restore(lane: u32) -> [u32; 20] {
+    let mut w = super::wave::WAVE_OR_V7_TO_S7;
+    if lane == 63 {
+        w[15] = 0x0001_3F01; // v_readlane_b32 s7, v1, 31 (was lane 32)
+    }
+    w[17] = 0xBEFE_0404; // s_mov_b64 exec, s[4:5]
+    w[18] = 0xD760_0007;
+    w[19] = match lane {
+        0 => 0x0001_0101,  // v_readlane_b32 s7, v1, 0
+        63 => 0x0001_7F01, // v_readlane_b32 s7, v1, 63
+        _ => unreachable!("lane 0 or 63"),
+    };
+    w
+}
+
+/// The wave OR of [`program`] read past the restore of EXEC ([`wave_or_read_past_the_restore`],
+/// lanes 0 and 63) is the section's: (1) `wave::sections` folds the readlane into it, its value a
+/// whole-wave OR; (2) the paired form gives the OR of both halves on the card, whichever lanes
+/// take the branch; (3) so do two host waves with the branch taken wave-wide. The paired form
+/// lowers the restore and the folded readlane with its own steps (`paired_inst`,
+/// `paired_section_inst`), as it does the section's other instructions.
+#[test]
+fn a_wave_or_read_past_the_restore_is_the_sections() {
+    // Paired-form dispatches that ran on the card: none without a device that takes the program.
+    let mut ran = 0;
+    for lane in [0u32, 63] {
+        let wave_or = wave_or_read_past_the_restore(lane);
+        for (skip, name) in [(0xBF88_0000, "s_cbranch_execz"), (0xBF84_0000, "s_cbranch_scc0")] {
+            let native = program_with(skip, &wave_or);
+            // (1) the section holds the readlane past its restore, a whole-wave OR
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+            let (b, start) = (0..p.blocks.len())
+                .find_map(|b| {
+                    let at = p.blocks[b].insts.iter().position(|i| i.name() == "s_or_saveexec_b64")?;
+                    Some((b, at))
+                })
+                .expect("the section's start");
+            let sections = super::wave::sections(&p, b);
+            let sec = sections.get(&start).expect("the section");
+            assert_eq!(sec.after, sec.end + 2, "lane {lane}: the readlane after the restore is the section's");
+            let read = &p.blocks[b].insts[sec.end + 1];
+            assert_eq!(read.name(), "v_readlane_b32", "lane {lane}");
+            let s7 = read.write(crate::ir::Reg::S(7)).expect("the readlane writes s7");
+            assert!(
+                matches!(
+                    sec.shapes.get(&s7),
+                    Some(super::wave::Shape::Active(super::wave::Op::Or, _, _, 0))
+                ),
+                "lane {lane}: {:?}",
+                sec.shapes.get(&s7)
+            );
+            // (2) the paired form on the card
+            let shader = paired(&native);
+            {
+                let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+                let cases = [(64u32, u32::MAX), (40, 0x000F_FFFF), (33, 0x0001_FFFF), (10, 0x1F), (1, 1), (0, 0)];
+                for (below, expected) in cases {
+                    let Some(got) = on_the_card(&shader, [below, 0]) else { break };
+                    assert_eq!(got, expected, "paired, lane {lane}, {name}: {below} threads in the branch");
+                    ran += 1;
+                }
+            }
+            // (3) two host waves, the branch taken wave-wide (it says itself whether it ran)
+            a_wave_or_inside_of(native, name);
+        }
+    }
+    if ran == 0 {
+        eprintln!("lanes 0 and 63 read past the restore: the sections checked; NOT run on the card (no device takes the paired form)");
+    } else {
+        eprintln!("lanes 0 and 63 read past the restore: the sections checked; paired form ran {ran} of 24 dispatches on the card");
+    }
 }
 
 /// One console wave of 64 threads, thread t holding the bit `1 << (t >> 1)`: the threads below
