@@ -14,9 +14,12 @@
 //!   write ([`crate::shadow::Shadow::gpu_writes`]), with the list and the
 //!   recording thread;
 //! - every submission, its lists in order, and, ahead of it, the 64 KiB
-//!   pages of title memory its ranges cover whose bytes changed since the
-//!   trace last held them (the first time: all of them), in `pages.bin`;
-//!   pages of zeros are named, not stored.
+//!   pages of title memory its ranges cover that the trace has not held
+//!   yet, whole (pages of zeros are named, not stored);
+//! - the bytes the layer copied from title memory into its copies while
+//!   the submission was prepared ([`copied`]): what the title changed, as
+//!   the write watch and the guards found it, at no cost of looking for
+//!   it again. Bytes go to `pages.bin`.
 //!
 //! What it leaves out (the replay's limits): the title's draws and
 //! dispatches (nothing is drawn: what shaders write is never written, so
@@ -52,14 +55,15 @@ const PAGE_BYTES: u64 = 5; // address, offset in pages.bin (u64::MAX: zeros)
 const SUBMIT: u64 = 6; // number, lists that follow, late
 const LIST: u64 = 7; // list
 const END: u64 = 8;
+const RUN: u64 = 9; // address, len, offset in pages.bin, submission
 
 struct Recorder {
     events: BufWriter<File>,
     pages: BufWriter<File>,
     /// Bytes written to `pages.bin`.
     at: u64,
-    /// The hash of each page as the trace last held it.
-    held: HashMap<u64, [u8; 32]>,
+    /// The pages the trace holds.
+    held: std::collections::HashSet<u64>,
     started: std::time::Instant,
     length: std::time::Duration,
     submissions: u64,
@@ -137,6 +141,20 @@ pub(crate) fn gpu_writes(list: usize, address: u64, len: u64) {
     with(|r| record(r, [GPU_WRITES, thread(), list as u64, address, len]));
 }
 
+/// The layer copied `len` bytes of title memory at `address` into a copy
+/// (`bytes`, the copy's side, now equal to title memory): the change the
+/// replay writes before the submission being prepared.
+pub(crate) fn copied(address: usize, bytes: *const u8, len: usize) {
+    with(|r| {
+        // SAFETY: the caller's mapping of `len` bytes.
+        let _ = r.pages.write_all(unsafe { std::slice::from_raw_parts(bytes, len) });
+        r.at += len as u64;
+        r.page_bytes += len as u64;
+        let (at, n) = (r.at - len as u64, r.submissions);
+        record(r, [RUN, address as u64, len as u64, at, n]);
+    });
+}
+
 /// A submission of `lists`, which bring `ranges` of title memory up to
 /// date: the changed pages of the ranges, then the submission. Starts and
 /// ends the trace by the clock.
@@ -165,14 +183,12 @@ pub(crate) fn submitting(lists: &[usize], ranges: &[(usize, usize)], late: bool)
     let mut buf = vec![0u8; PAGE as usize];
     for page in pages {
         let address = page * PAGE;
+        if !r.held.insert(address) {
+            continue;
+        }
         // Through the kernel's read: unmapped pages read as zeros, guards
         // are not touched.
         crate::host::copy_mapped(buf.as_mut_ptr(), address as *const u8, PAGE as usize, false);
-        let hash = *blake3::hash(&buf).as_bytes();
-        if r.held.get(&address) == Some(&hash) {
-            continue;
-        }
-        r.held.insert(address, hash);
         let at = if buf.iter().all(|&b| b == 0) {
             u64::MAX
         } else {
@@ -219,7 +235,7 @@ fn start(folder: &Path) {
         events,
         pages,
         at: 0,
-        held: HashMap::new(),
+        held: std::collections::HashSet::new(),
         started: std::time::Instant::now(),
         length: seconds("VICTORY_TRACE_FOR", 10.0),
         submissions: 0,
@@ -294,6 +310,7 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
         }
     }
     let (mut mapped, mut refused) = (0u64, 0u64);
+    let mut owned: Vec<(u64, u64)> = Vec::new();
     for &(a, b) in &runs {
         // SAFETY: a fixed address the replay owns, or a refusal.
         let p = unsafe { VirtualAlloc(a as *const _, (b - a) as usize, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
@@ -301,8 +318,23 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
             refused += b - a;
         } else {
             mapped += b - a;
+            owned.push((a, b));
         }
     }
+    // Writes into title memory as the title makes them: plain stores, which
+    // the write watch sees; none where the replay could not map.
+    let inside = |address: u64, len: u64| -> bool {
+        let i = owned.partition_point(|&(a, _)| a <= address);
+        i > 0 && owned[i - 1].1 >= address + len
+    };
+    let write_title = |address: u64, bytes: &[u8]| -> bool {
+        if !inside(address, bytes.len() as u64) {
+            return false;
+        }
+        // SAFETY: inside a run the replay mapped read-write.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
+        true
+    };
     tracing::info!(
         "trace replay: {} events, title memory in {} runs, {} MB mapped, {} MB refused (taken in this process)",
         events.len(),
@@ -310,8 +342,16 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
         mapped >> 20,
         refused >> 20
     );
+    // The bytes copied while each submission was prepared.
+    let mut runs_of: HashMap<u64, Vec<(u64, u64, u64)>> = HashMap::new();
+    for e in &events {
+        if e[0] == RUN {
+            runs_of.entry(e[4]).or_default().push((e[1], e[2], e[3]));
+        }
+    }
     let mut results = Vec::new();
     let mut buf = vec![0u8; PAGE as usize];
+    let mut run_buf = Vec::new();
     for _ in 0..passes {
         let mut out = Replayed::default();
         let started = std::time::Instant::now();
@@ -348,30 +388,28 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
                 }
                 PAGE_BYTES => {
                     let written_at = std::time::Instant::now();
-                    let dst = e[1] as *mut u8;
+                    let dst = e[1];
                     if e[2] == u64::MAX {
                         buf.fill(0);
                     } else {
                         pages.seek_read(&mut buf, e[2]).map_err(|err| format!("pages.bin at {}: {err}", e[2]))?;
                     }
-                    // SAFETY: a page the replay mapped above (a refused
-                    // run is skipped by the kernel's write, which fails).
-                    let ok = unsafe {
-                        let mut written = 0usize;
-                        windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory(
-                            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                            dst as *const _,
-                            buf.as_ptr() as *const _,
-                            PAGE as usize,
-                            &mut written,
-                        ) != 0
-                    };
-                    if !ok {
+                    if !write_title(dst as u64, &buf) {
                         out.unchecked += 1;
                     }
                     out.pages_ms += written_at.elapsed().as_secs_f64() * 1e3;
                 }
                 SUBMIT => {
+                    // What the title changed for this submission.
+                    let written_at = std::time::Instant::now();
+                    for &(address, len, at) in runs_of.get(&e[1]).map_or(&[][..], |v| &v[..]) {
+                        run_buf.resize(len as usize, 0);
+                        pages.seek_read(&mut run_buf, at).map_err(|err| format!("pages.bin at {at}: {err}"))?;
+                        if !write_title(address, &run_buf) {
+                            out.unchecked += 1;
+                        }
+                    }
+                    out.pages_ms += written_at.elapsed().as_secs_f64() * 1e3;
                     let n = e[2] as usize;
                     let ids: Vec<u64> = events[i..i + n].iter().map(|l| l[1]).collect();
                     i += n;
@@ -391,7 +429,7 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
                         for (_, ranges) in &taken {
                             for &(a, n) in ranges {
                                 let Some(shadow) = crate::shadow::find(a, n) else { continue };
-                                match shadow.cpu_side(a, n) {
+                                match shadow.cpu_side(a, n).filter(|side| inside(a, side.len() as u64)) {
                                     Some(side) => {
                                         out.checked += 1;
                                         // SAFETY: mapped title memory of the replay.
@@ -417,3 +455,4 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
     }
     Ok(results)
 }
+
