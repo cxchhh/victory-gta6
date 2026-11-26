@@ -8340,6 +8340,27 @@ impl HostList {
     }
 }
 
+/// For switches set to `alt` (an A/B within one run): whether switch
+/// number `which` (an index of [`ALTERNATING`]) is on now. Twenty seconds
+/// off, twenty on, in turn, from the first ask of any of them, so that
+/// switches in turn together change at the same moments; each change is
+/// said in the log as "`name`=alt: ON" or "`name`=alt: off", which
+/// `altstats.py` splits the frame lines by.
+pub(crate) fn alternate(which: usize, name: &str) -> bool {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    if let Some(last) = ALTERNATING.get(which)
+        && last.swap(u8::from(on), Ordering::Relaxed) != u8::from(on)
+    {
+        tracing::info!("{name}=alt: {}", if on { "ON" } else { "off" });
+    }
+    on
+}
+
+/// The last state said of each switch in turn ([`alternate`]); 2 before
+/// the first.
+static ALTERNATING: [std::sync::atomic::AtomicU8; 8] = [const { std::sync::atomic::AtomicU8::new(2) }; 8];
+
 /// Whether a submission's refreshes of host copies run on several threads,
 /// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
 ///
@@ -8367,18 +8388,7 @@ fn wide_refresh() -> bool {
     }) {
         0 => false,
         1 => true,
-        _ => {
-            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
-            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
-                tracing::info!(
-                    "a submission's copies are spread over the helper threads from now (VICTORY_WIDE_REFRESH=alt): {}",
-                    if on { "ON" } else { "off, one after the other as usual" }
-                );
-            }
-            on
-        }
+        _ => crate::host::alternate(1, "VICTORY_WIDE_REFRESH"),
     }
 }
 

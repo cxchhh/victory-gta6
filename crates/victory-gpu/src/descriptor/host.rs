@@ -3550,9 +3550,20 @@ pub(crate) static MIRROR_FAST: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// made from the title's record without taking the slots' lock (in the
 /// world 85% of its calls, and the lock's waits were 180 ms a frame over
 /// the recording threads). Off (unset or 0): every call takes the lock.
+/// `alt`: twenty seconds with, twenty without, in turn, each change said
+/// in the log (an A/B within one run: same scene, same moment).
 pub(crate) fn mirror_fast() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MIRROR_FAST").is_some_and(|v| v == "1"))
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_MIRROR_FAST").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => crate::host::alternate(0, "VICTORY_MIRROR_FAST"),
+    }
 }
 
 pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

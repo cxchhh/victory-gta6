@@ -4323,18 +4323,7 @@ fn lookup_cache() -> bool {
     }) {
         0 => false,
         1 => true,
-        _ => {
-            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
-            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
-                tracing::info!(
-                    "a thread remembers what its asks for a buffer's host copy found from now (VICTORY_LOOKUP_CACHE=alt): {}",
-                    if on { "ON" } else { "off, every ask goes to the tables as usual" }
-                );
-            }
-            on
-        }
+        _ => crate::host::alternate(2, "VICTORY_LOOKUP_CACHE"),
     }
 }
 
