@@ -255,7 +255,7 @@ fn trust_indirect() -> bool {
 static TRUSTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a list that stopped gathering is cut so that it gathers again
-/// (`VICTORY_GATHER_CUTS=1`; needs [`gathers`] and the lists cut at their
+/// (on by default, `VICTORY_GATHER_CUTS=0` turns it off; needs [`gathers`] and the lists cut at their
 /// waits, `crate::queue::cuts`).
 ///
 /// A list's prelude clamps the records it gathered before the list runs,
@@ -270,10 +270,11 @@ static TRUSTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// its own, which runs after the part before (its pass waits for every
 /// earlier shader write first) and clamps every record that part
 /// gathers in one pass. The order of everything on the card stays the
-/// console's.
+/// console's. cut1 (10 minutes, 2K): the card's time 140 -> 60 ms a frame,
+/// frames 250 -> 217 ms (median), no error.
 pub(crate) fn gather_cuts() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GATHER_CUTS").is_some_and(|v| v == "1")) && gathers() && windows()
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GATHER_CUTS").is_none_or(|v| v != "0")) && gathers() && windows()
 }
 
 /// Lists cut so that they gather again ([`gather_cuts`]) since the last
@@ -402,7 +403,7 @@ pub(crate) fn window_line(frames: f64) {
         "indirect commands per frame by their clamp: {:.0} read from a window (no pass of ours); a pass of ours for {:.0}: {:.0} dispatches, {:.0} of more than one record, {:.0} with a count \
          buffer, {:.0} whose shaders can store to buffers, {:.0} first on their list, {:.0} with no window on their argument buffer, {:.0} off the window's walk, {:.0} past the window's end; \
          {:.0} records clamped by those passes; {:.0} of the passes opened a window at a remembered step (VICTORY_WINDOW_JUMP=1), {:.0} of those windows were read by no draw; \
-         {:.0} read a record gathered for their list's prelude (VICTORY_INDIRECT_GATHER=1), {:.0} asked for one and got none          (no fit for the clamp {:.0}, the list had stopped gathering {:.0}, too many buffers {:.0}, the set full {:.0}, no buffer {:.0}); {:.0} run on the title's own records (VICTORY_INDIRECT_TRUST=1); {:.0} lists cut to gather again (VICTORY_GATHER_CUTS=1)",
+         {:.0} read a record gathered for their list's prelude (VICTORY_INDIRECT_GATHER=1), {:.0} asked for one and got none          (no fit for the clamp {:.0}, the list had stopped gathering {:.0}, too many buffers {:.0}, the set full {:.0}, no buffer {:.0}); {:.0} run on the title's own records (VICTORY_INDIRECT_TRUST=1); {:.0} lists cut to gather again (VICTORY_GATHER_CUTS)",
         n[0],
         n[1..9].iter().sum::<f64>(),
         n[1],
