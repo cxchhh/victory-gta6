@@ -313,8 +313,18 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
     let mut owned: Vec<(u64, u64)> = Vec::new();
     for &(a, b) in &runs {
         // SAFETY: a fixed address the replay owns, or a refusal.
-        let p = unsafe { VirtualAlloc(a as *const _, (b - a) as usize, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
-        if p.is_null() {
+        // (Address 0 asks the kernel to choose: the first 64 KiB are never
+        // the title's; any other answer than the address asked is let go.)
+        let p = if a < PAGE {
+            std::ptr::null_mut()
+        } else {
+            unsafe { VirtualAlloc(a as *const _, (b - a) as usize, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }
+        };
+        if !p.is_null() && p as u64 != a {
+            // SAFETY: the allocation just made, whole.
+            unsafe { windows_sys::Win32::System::Memory::VirtualFree(p, 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
+            refused += b - a;
+        } else if p.is_null() {
             refused += b - a;
         } else {
             mapped += b - a;
@@ -362,10 +372,19 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
         while i < events.len() {
             let e = events[i];
             i += 1;
+            if std::env::var_os("VICTORY_TRACE_STEPS").is_some() && (i % 50_000 == 0 || (e[0] != REGISTER && i < 400_000)) {
+                eprintln!("replay event {i}: {e:x?}");
+            }
             match e[0] {
                 REGISTER => crate::shadow::register(e[1] as usize, e[2], e[3]),
                 UNREGISTER => crate::shadow::unregister(e[1] as usize, e[2]),
                 REFRESH | GPU_WRITES => {
+                    // Asks of memory the replay could not map (null views,
+                    // memory of the title's not traced) are left out.
+                    if !inside(e[3], e[4].max(1)) {
+                        out.no_copy += 1;
+                        continue;
+                    }
                     let asked = std::time::Instant::now();
                     let entry = match lists.entry(e[2]) {
                         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
@@ -425,6 +444,17 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
                     host.execute(&runs);
                     out.submit_ms += sent.elapsed().as_secs_f64() * 1e3;
                     out.submissions += 1;
+                    if out.submissions % 50 == 0 {
+                        eprintln!(
+                            "replay: {} submissions in {:.0} ms (asks {:.0}, pages {:.0}, submit {:.0}), {} asks left out",
+                            out.submissions,
+                            started.elapsed().as_secs_f64() * 1e3,
+                            out.asks_ms,
+                            out.pages_ms,
+                            out.submit_ms,
+                            out.no_copy
+                        );
+                    }
                     if verify {
                         for (_, ranges) in &taken {
                             for &(a, n) in ranges {
