@@ -2937,8 +2937,9 @@ impl Shadow {
         // now on: readers and writers then share one host copy. Shaders
         // given the mirror itself to write would write it unseen: that is
         // counted, and the pages leave it too.
-        crate::flat::gpu_wrote(address, len);
-        if self.flat {
+        if !self.flat {
+            crate::flat::gpu_wrote(address, len);
+        } else if !crate::flat::writes() {
             crate::flat::written_through(address, len);
             return;
         }
@@ -4418,10 +4419,11 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 }
 
 /// For the mirror of title memory (`crate::flat`), of the page
-/// `[from, to)`: whether every title buffer on it starts on 256 bytes (then
-/// a title address is at the same place modulo 256 in the mirror and in
-/// any copy [`lookup`] would find: constant buffers' rows and raw views'
-/// bias agree whichever was asked), and, if no buffer starts or ends inside
+/// `[from, to)`: whether every title buffer on it starts on 16 bytes (then
+/// a title address is at the same place modulo 16 in the mirror and in any
+/// copy [`lookup`] would find: a raw view's bias, which the shader adds and
+/// another lookup computes, agrees whichever was asked; constant buffers'
+/// rows are computed from one lookup with the view), and, if no buffer starts or ends inside
 /// the page, the end of the buffer [`lookup`] would find for an address on
 /// it (`Some(0)`: none, memory outside buffers). `note` is called with the
 /// answer while the table's lock is held, so that [`register`] cannot come
@@ -4434,7 +4436,7 @@ pub(crate) fn page_layout(from: u64, to: u64, note: impl FnOnce(bool, Option<u64
         if entry.end <= from {
             continue;
         }
-        aligned &= key.0 % 256 == 0;
+        aligned &= key.0 % 16 == 0;
         even &= !(key.0 > from && key.0 < to) && !(entry.end > from && entry.end < to);
     }
     let end = even.then(|| inner_end(&map, from).unwrap_or(0));
@@ -4462,6 +4464,18 @@ fn inner_end(map: &BTreeMap<(u64, usize), Entry>, address: u64) -> Option<u64> {
 /// holds it if the mirror may take it, else as [`find`].
 pub(crate) fn find_read(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = crate::flat::find(address, len) {
+        return Some(shadow);
+    }
+    find(address, len)
+}
+
+/// [`find`] for an ask shaders write (an unordered access view, a root
+/// unordered access view): with `VICTORY_FLAT=2` the window of the mirror
+/// if the mirror takes it and the card can own its pages, else as [`find`]
+/// (the caller then says the pages are the copies' if it found a copy:
+/// `crate::flat::gpu_wrote`).
+pub(crate) fn find_write(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if let Some(shadow) = crate::flat::find_write(address, len) {
         return Some(shadow);
     }
     find(address, len)

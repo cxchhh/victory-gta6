@@ -1872,10 +1872,12 @@ impl State {
                 .map_or(u64::MAX, |mb| mb << 20)
         });
         let find = |a: u64| {
-            let s = crate::shadow::find(a, 1)?;
-            // Shaders may write it: its pages are the copies'
-            // (`crate::flat`).
-            crate::flat::gpu_wrote(a, s.left(a));
+            // In the mirror if it takes it (`crate::flat`, `VICTORY_FLAT=2`);
+            // in a copy, whose pages then leave the mirror.
+            let s = crate::shadow::find_write(a, 1)?;
+            if !s.is_flat() {
+                crate::flat::gpu_wrote(a, s.left(a));
+            }
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {

@@ -181,6 +181,30 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 }
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
+/// [`writes`] (with guards) of many ranges `(start, end)` at once: those
+/// inside a range asked ahead ([`ask_ahead`]) are answered from the journal
+/// under one lock, the others one by one as [`writes`] answers them. The
+/// answers in the ranges' order.
+pub(crate) fn writes_many(ranges: &[(usize, usize)]) -> Vec<Option<(u64, Vec<(usize, u64)>)>> {
+    let mut out: Vec<Option<(u64, Vec<(usize, u64)>)>> = vec![None; ranges.len()];
+    let mut alone = Vec::new();
+    {
+        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, &(start, end)) in ranges.iter().enumerate() {
+            let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+            if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+                out[i] = Some((j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+            } else {
+                alone.push(i);
+            }
+        }
+    }
+    for i in alone {
+        out[i] = writes(ranges[i].0, ranges[i].1, true);
+    }
+    out
+}
+
 pub(crate) fn ask_ahead_done() {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if !j.kept {
@@ -1964,11 +1988,12 @@ pub(crate) fn title_memory_reading_at_now(from: usize, to: usize) -> Option<Read
 /// this and [`title_memory_remapped`] are the only ways a block noted
 /// uncommitted is asked about again.
 pub fn title_memory_committed(at: usize, len: usize) {
+    // The mirror sends these pages again, and lets go of what the card
+    // owned there (`crate::flat`), before anything is fetched into them.
+    crate::flat::remapped(at, len);
     // Kept pieces there (`crate::lazy`) go in, or are dropped if the
     // memory is new (its protection is no longer ours).
     crate::lazy::need(at, at.saturating_add(len));
-    // The mirror sends these pages again (`crate::flat`).
-    crate::flat::remapped(at, len);
     if len == 0 || absent_mode() == 0 {
         return;
     }
@@ -1988,10 +2013,11 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // What it shows is new: the mirror sends it again and lets go of what
+    // the card owned there (`crate::flat`).
+    crate::flat::remapped(at, len);
     // As at a commit ([`title_memory_committed`]).
     crate::lazy::need(at, at.saturating_add(len));
-    // What it shows is new: the mirror sends it again (`crate::flat`).
-    crate::flat::remapped(at, len);
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
     crate::backreads::remapped(at, len);
@@ -2061,10 +2087,12 @@ pub(crate) unsafe extern "system" fn on_write(
     // A read or a write of a page whose card bytes are kept for later
     // (`crate::lazy`): they go in, the page is given back, the access goes
     // on.
+    // Or a page the card owns (`crate::flat`): fetched back, the same.
     if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
         && r.NumberParameters >= 2
         && r.ExceptionInformation[0] <= WRITE
-        && crate::lazy::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE)
+        && (crate::flat::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE)
+            || crate::lazy::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE))
     {
         return EXCEPTION_CONTINUE_EXECUTION;
     }

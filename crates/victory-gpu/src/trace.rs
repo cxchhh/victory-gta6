@@ -394,7 +394,7 @@ pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>,
                     };
                     // A read goes where a read goes (with `VICTORY_FLAT=1`
                     // the mirror, `crate::flat`), a write to the copies.
-                    let found = if e[0] == REFRESH { crate::shadow::find_read(e[3], e[4]) } else { crate::shadow::find(e[3], e[4]) };
+                    let found = if e[0] == REFRESH { crate::shadow::find_read(e[3], e[4]) } else { crate::shadow::find_write(e[3], e[4]) };
                     let Some(shadow) = found else {
                         out.no_copy += 1;
                         continue;

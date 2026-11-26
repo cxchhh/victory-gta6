@@ -2830,7 +2830,7 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     // memory if it takes it (`crate::flat`), unordered access in a copy.
     let writes = matches!(view, View::Unordered(..) | View::Placed(true, ..));
     let find = |address: u64, len: u64| {
-        if writes { crate::shadow::find(address, len) } else { crate::shadow::find_read(address, len) }
+        if writes { crate::shadow::find_write(address, len) } else { crate::shadow::find_read(address, len) }
     };
     // A view off its buffer's elements is made on a copy of its own bytes
     // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
@@ -3169,9 +3169,12 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    // Shaders may write it: its pages are the copies' (`crate::flat`).
-    crate::flat::gpu_wrote(address, len);
-    let shadow = crate::shadow::find(address, len)?;
+    // Shaders write it: in the mirror if it takes it (`crate::flat`,
+    // `VICTORY_FLAT=2`); in a copy, whose pages then leave the mirror.
+    let shadow = crate::shadow::find_write(address, len)?;
+    if !shadow.is_flat() {
+        crate::flat::gpu_wrote(address, len);
+    }
     // Off the elements of that copy: on a copy of its own bytes, from its
     // element 0 (`own_bytes`).
     let (shadow, own) = {

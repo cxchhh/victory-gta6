@@ -3821,6 +3821,7 @@ fn given_to_shaders<'a>(
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step
                 && (!carded || shadow.carded())
+                && !shadow.is_flat()
             {
                 given.push((shadow.clone(), (*address, *address + *len)));
             }
@@ -4523,7 +4524,9 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     }
     for list in if indexed { &[][..] } else { runs } {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len) = step
+                && !shadow.is_flat()
+            {
                 let range = (*address, *address + *len);
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                     Some((_, ranges)) => {
@@ -6506,11 +6509,6 @@ impl Host {
         batch.flush_textures();
         batch.flush();
         crate::watch::ask_once_end();
-        // The mirror of title memory (`crate::flat`): its new tiles and the
-        // pages its windows' refreshes named that the title wrote, ahead of
-        // the lists on the queue. The next value of the fence is signalled
-        // behind them.
-        crate::flat::submit(&self.queue, &self.fence, *submitted + 1, std::mem::take(&mut batch.flat));
         part = prep_part(2, part);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -6538,6 +6536,19 @@ impl Host {
             lists.push(Some(check));
         }
         prep_part(4, part);
+        // The mirror of title memory (`crate::flat`): its new tiles and the
+        // pages its windows' refreshes named that the title wrote, ahead of
+        // the lists on the queue (the last thing before them: the pages its
+        // shaders write are the card's from here on, and nothing of ours
+        // touches them until `sent`). The next value of the fence is
+        // signalled behind them.
+        let owning = crate::flat::submit(
+            &self.queue,
+            &self.fence,
+            *submitted + 1,
+            std::mem::take(&mut batch.flat),
+            std::mem::take(&mut batch.flat_written),
+        );
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -6547,6 +6558,9 @@ impl Host {
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            if let Some(owning) = owning {
+                owning.sent(*submitted);
+            }
             prep_part(5, prepared);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6633,6 +6647,9 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        if let Some(owning) = owning {
+            owning.sent(*submitted);
+        }
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -8332,6 +8349,12 @@ impl HostList {
                     }
                     continue;
                 }
+                // A window of the mirror (`crate::flat`, `VICTORY_FLAT=2`):
+                // the card owns its pages once the submission is sent.
+                Step::GpuWrite(shadow, address, len) if shadow.is_flat() => {
+                    batch.flat_written.push((*address, *len));
+                    continue;
+                }
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
@@ -8574,6 +8597,8 @@ struct Batch {
     /// The ranges (title address, bytes) refreshes named in windows of the
     /// mirror (`crate::flat`): sent together once the steps have run.
     flat: Vec<(usize, usize)>,
+    /// The ranges shaders write in windows of the mirror.
+    flat_written: Vec<(usize, usize)>,
 }
 
 impl Batch {

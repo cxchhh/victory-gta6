@@ -583,6 +583,8 @@ fn take(first: usize, last: usize) -> (Vec<(usize, Vec<Piece>, u16)>, bool) {
 /// for a page another thread is resolving. Nothing if none is kept, or if
 /// this thread is resolving or merging itself ([`busy`]).
 pub(crate) fn need(from: usize, to: usize) {
+    // Pages the card owns in the mirror (`crate::flat`) come back first.
+    crate::flat::need(from, to);
     if PAGES.load(Relaxed) == 0 || from >= to || is_busy() {
         return;
     }

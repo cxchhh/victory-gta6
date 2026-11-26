@@ -152,7 +152,7 @@ fn install() {
         if read
             && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
             && r.NumberParameters >= 2
-            && crate::lazy::fault(r.ExceptionInformation[1], false)
+            && (crate::flat::fault(r.ExceptionInformation[1], false) || crate::lazy::fault(r.ExceptionInformation[1], false))
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }

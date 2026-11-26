@@ -36,9 +36,9 @@
 //!   made again ([`evictions`], `HostHeap::mirror`). Also left to the
 //!   copies: asks that cross a window's line, views off their copy's elements
 //!   (`crate::shadow::exact`), pages where a title buffer does not start
-//!   on 256 bytes (there a copy's offsets and the mirror's differ modulo
-//!   256, and constant buffers' rows and raw views' bias are computed from
-//!   either), and shader-side raw pointers (`crate::memory`).
+//!   on 16 bytes (there a copy's offsets and the mirror's differ modulo 16,
+//!   and a raw view's bias is computed by another lookup than its view's),
+//!   and shader-side raw pointers (`crate::memory`).
 //! - The card only ever sees the mirror change through copies of ours on
 //!   its queue: at each submission the pages its refreshes name that the
 //!   title wrote since they were last sent (the write watch's journal, or
@@ -84,14 +84,24 @@ fn window_bits() -> u32 {
     })
 }
 
-/// `VICTORY_FLAT`: 0 (unset) off; 1 `census`; 2 `1`, the mirror.
+/// `VICTORY_FLAT`: 0 (unset) off; 1 `census`; 2 `1`, the mirror of what
+/// shaders read; 3 `2`, the mirror of what they read and write.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_FLAT").as_deref().map(str::trim) {
         Ok("census") => 1,
         Ok("1") => 2,
+        Ok("2") => 3,
         _ => 0,
     })
+}
+
+/// Whether shaders write the mirror too (`VICTORY_FLAT=2`): unordered
+/// access views and root unordered access views of pages the mirror can
+/// own go to it ([`find_write`]), and what they write stays there until
+/// the CPU touches it ([`Space::resolve`]).
+pub(crate) fn writes() -> bool {
+    on() && mode() == 3
 }
 
 /// Whether the census is on (`VICTORY_FLAT=census`).
@@ -105,7 +115,7 @@ pub(crate) fn census() -> bool {
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        if mode() != 2 {
+        if mode() < 2 {
             return false;
         }
         if crate::inplace::level() != 0 {
@@ -122,9 +132,19 @@ pub(crate) fn on() -> bool {
 const MAPPED: u8 = 1;
 const GPU: u8 = 2;
 const USED: u8 = 4;
+/// With [`writes`]: the card owns the page (shaders of a submission sent
+/// wrote it; its title memory is `PAGE_NOACCESS` and older than the
+/// mirror); a thread is fetching it back; it was looked at and can be
+/// owned (plain write-watched read-write memory), or cannot; a submission
+/// being prepared will write it (its title memory is read-only meanwhile).
+const CARD: u8 = 8;
+const RESOLVING: u8 = 16;
+const OWNABLE: u8 = 32;
+const NOT_OWNABLE: u8 = 64;
+const PENDING: u8 = 128;
 
 /// [`Page::layout`]: the note is there; every title buffer on the page
-/// starts on 256 bytes; no buffer starts or ends inside the page, and the
+/// starts on 16 bytes; no buffer starts or ends inside the page, and the
 /// low bits are the end of the buffer an address on it is in (0: none).
 const KNOWN: u64 = 1 << 63;
 const ALIGNED: u64 = 1 << 62;
@@ -145,7 +165,30 @@ struct Page {
     /// What the title buffers on it look like (`crate::shadow::page_layout`;
     /// 0: not known, asked again).
     layout: AtomicU64,
+    /// With [`CARD`]: the host fence's value behind the last submission
+    /// whose shaders write the page.
+    fence: AtomicU64,
+    /// Writes of the CPU that fetched the page back: one that keeps doing
+    /// it may leave the mirror ([`touches_most`]).
+    touches: AtomicU8,
 }
+
+/// Fetches by a CPU write after which a page leaves the mirror for the
+/// copies (`VICTORY_FLAT_TOUCHES`; 0, never, by default): the CPU and the
+/// shaders both write it every frame (the census's "double dirty" pages),
+/// and each write waits for the card. Off by default: a page that leaves
+/// sends every ask shaders write that holds it to a copy, which takes the
+/// whole range out of the mirror with it (the trace replay lost 10,000
+/// asks a submission that way from a few pages).
+fn touches_most() -> u8 {
+    static MOST: OnceLock<u8> = OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_FLAT_TOUCHES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// The longest a fetch waits for the card (or for the lock): past it the
+/// touch is not taken (a crash report names the address) and it is
+/// counted, so that a fault of ours shows instead of a frozen game.
+const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A window's title addresses and their reserved buffer.
 pub(crate) struct Window {
@@ -182,6 +225,11 @@ struct Slot {
     list: ID3D12GraphicsCommandList,
     staging: Option<(ID3D12Resource, *mut u8, u64)>,
     fence: u64,
+    /// Two timestamps around its copies and where they are resolved
+    /// (mapped); whether the last list wrote them (read when the slot is
+    /// used again: the card's time of the mirror's copies).
+    stamps: Option<(ID3D12QueryHeap, ID3D12Resource, *const u64)>,
+    timed: bool,
 }
 
 /// Since the last frame line (the ones marked so: since the start).
@@ -191,12 +239,14 @@ pub(crate) enum S {
     /// Asks the mirror took.
     Served,
     /// Asks left to the copies: a page shaders may write; a page whose
-    /// buffers do not all start on 256 bytes; across a window's line; no
+    /// buffers do not all start on 16 bytes; across a window's line; no
     /// tiles left.
     ToCopiesWritten,
     ToCopiesUnaligned,
     ToCopiesCrossing,
     ToCopiesNoTiles,
+    /// With [`writes`]: an ask shaders write of a page the card cannot own.
+    ToCopiesNotOwnable,
     /// Pages sent, their bytes, the runs they went in, and the time it took
     /// the submitting thread (asking, copying, recording; microseconds).
     PagesSent,
@@ -214,6 +264,27 @@ pub(crate) enum S {
     /// shader writes declared on the mirror itself (lost).
     Evicted,
     WrittenThrough,
+    /// With [`writes`]: pages shaders write in the mirror (per submission,
+    /// counted once), pages the card came to own, pages fetched back by a
+    /// touch (fault) and by our own readers, their microseconds, pages that
+    /// left the mirror after too many writes of the CPU, touches that were
+    /// not taken (on the submitting thread, or a wait past the limit), pages
+    /// that could not be owned and were fetched at once.
+    PagesWritten,
+    Owned,
+    Faulted,
+    Needed,
+    FetchUs,
+    TouchedOut,
+    NotTaken,
+    Eager,
+    /// The part of the send spent looking for written pages, and copying
+    /// (microseconds).
+    ScanUs,
+    CopyUs,
+    /// The card's time of the lists that copy the sends into the windows
+    /// (microseconds, read when their slot is used again).
+    CardUs,
     /// Submissions that sent something.
     Sends,
 }
@@ -242,6 +313,40 @@ pub(crate) struct Space {
     given: Mutex<Vec<Given>>,
     ring: Mutex<Vec<Slot>>,
     stats: [AtomicU64; STATS_LEN],
+    /// With [`writes`]: shaders may write the mirror.
+    gpu: bool,
+    /// Held from the protection of the pages a submission's shaders write
+    /// to their marking as the card's ([`Space::begin`], [`Owning::sent`]),
+    /// and by a fetch while it looks at and changes the pages' state (not
+    /// while it waits).
+    owning: Mutex<()>,
+    /// Pages the card owns or will ([`CARD`], [`PENDING`]).
+    owned: AtomicU64,
+    /// The host's fence (the one [`Space::upload`] is given).
+    fence: Mutex<Option<ID3D12Fence>>,
+    /// The fetch's own copy queue, list, read-back memory and fence.
+    fetch: Mutex<Option<Fetch>>,
+}
+
+/// What fetches pages back from the card: a copy queue of its own (the
+/// pages are fetched after the card finished the submissions that wrote
+/// them; the direct queue is not stood behind).
+struct Fetch {
+    queue: ID3D12CommandQueue,
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    value: u64,
+    event: windows::Win32::Foundation::HANDLE,
+    readback: ID3D12Resource,
+    data: *mut u8,
+    size: u64,
+}
+
+thread_local! {
+    /// This thread holds a space's [`Space::owning`] lock for a submission:
+    /// a touch of title memory the card owns cannot be waited for here.
+    static SUBMITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // SAFETY: D3D12 objects are free-threaded; the upload mappings are written
@@ -268,11 +373,14 @@ fn space() -> Option<&'static Space> {
     if !on() {
         return None;
     }
-    SPACE
+    let space = SPACE
         .get_or_init(|| {
             let host = crate::host::host()?;
             let mb = std::env::var("VICTORY_FLAT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1536);
-            let space = Space::new(&host.device, (mb << 20) / PAGE);
+            let mut space = Space::new(&host.device, (mb << 20) / PAGE);
+            if let Some(space) = space.as_mut() {
+                space.gpu = writes();
+            }
             tracing::info!(
                 made = space.is_some(),
                 budget_mb = mb,
@@ -280,7 +388,15 @@ fn space() -> Option<&'static Space> {
             );
             space
         })
-        .as_ref()
+        .as_ref()?;
+    // Faults of title memory the card owns are looked up in it.
+    static TAKEN: std::sync::Once = std::sync::Once::new();
+    TAKEN.call_once(|| {
+        if space.gpu {
+            space.take_faults();
+        }
+    });
+    Some(space)
 }
 
 static SPACE: OnceLock<Option<Space>> = OnceLock::new();
@@ -299,6 +415,57 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     space()?.find(address, len)
+}
+
+/// [`find`] for an ask shaders write (`VICTORY_FLAT=2`): the window, if
+/// the mirror takes it and can own its pages; `None` sends it to the
+/// copies.
+pub(crate) fn find_write(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !writes() {
+        return None;
+    }
+    space()?.find_as(address, len, true)
+}
+
+/// Before our own read or write of title memory `[from, to)` (from
+/// `crate::lazy::need`): the pages the card owns there are fetched back.
+pub(crate) fn need(from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    for space in fault_spaces() {
+        if space.owned.load(Ordering::Acquire) != 0 {
+            space.need(from as u64, to as u64);
+        }
+    }
+}
+
+/// From the vectored handler: a read (or with `write` a write) of `at`
+/// faulted. True if the card owned the page and it was fetched back (the
+/// access goes on).
+pub(crate) fn fault(at: usize, write: bool) -> bool {
+    for space in fault_spaces() {
+        if space.owned.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        if let Some(taken) = space.fault(at as u64, write) {
+            return taken;
+        }
+    }
+    false
+}
+
+/// The spaces a fault is looked up in: the host's mirror and the tests'.
+static FAULT_SPACES: [std::sync::atomic::AtomicPtr<Space>; 8] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 8];
+
+fn fault_spaces() -> impl Iterator<Item = &'static Space> {
+    FAULT_SPACES.iter().map_while(|p| {
+        let p = p.load(Ordering::Acquire);
+        // SAFETY: only spaces that live for good are put there
+        // ([`Space::take_faults`]).
+        (!p.is_null()).then(|| unsafe { &*p })
+    })
 }
 
 /// Bytes from `address` to the end of what an ask without a length
@@ -346,7 +513,7 @@ pub(crate) fn buffers_changed(start: u64, len: u64) {
 /// are sent again when a refresh next names them.
 pub(crate) fn remapped(at: usize, len: usize) {
     if let Some(space) = made() {
-        space.each_page(at as u64, len.max(1) as u64, |page| page.sent.store(0, Ordering::Release));
+        space.forget(at as u64, len.max(1) as u64);
     }
 }
 
@@ -355,10 +522,123 @@ pub(crate) fn remapped(at: usize, len: usize) {
 /// `ranges` (title address, bytes: the refreshes of windows) the title
 /// wrote since, ahead of the lists. `next`: the value the host's `fence`
 /// is signalled with behind this submission's lists.
-pub(crate) fn submit(queue: &ID3D12CommandQueue, fence: &ID3D12Fence, next: u64, ranges: Vec<(usize, usize)>) {
-    if let Some(space) = made() {
-        space.upload(queue, fence, next, &ranges);
+///
+/// `written`: the ranges (title address, bytes) shaders of the submission
+/// were declared to write in windows ([`writes`]). Their pages are
+/// brought up to date with the others and become the card's when the
+/// caller says the submission was sent ([`Owning::sent`]), which it must
+/// do with what this returns, at once after its `ExecuteCommandLists` and
+/// signal: nothing of ours may touch title memory in between.
+pub(crate) fn submit(
+    queue: &ID3D12CommandQueue,
+    fence: &ID3D12Fence,
+    next: u64,
+    ranges: Vec<(usize, usize)>,
+    written: Vec<(usize, usize)>,
+) -> Option<Owning<'static>> {
+    let space = made()?;
+    let owning = space.begin(&written);
+    let mut ranges = ranges;
+    ranges.extend(owning.as_ref().map_or(&[][..], |o| &o.named[..]).iter().copied());
+    space.upload(queue, fence, next, &ranges);
+    owning
+}
+
+/// The pages a submission's shaders write, protected read-only while it is
+/// prepared ([`Space::begin`]); [`Owning::sent`] makes them the card's.
+pub(crate) struct Owning<'a> {
+    space: &'a Space,
+    _lock: std::sync::MutexGuard<'a, ()>,
+    /// (window, page) the card will own; and those whose memory could not
+    /// be protected, fetched as soon as the card is done.
+    pages: Vec<(Arc<Window>, usize)>,
+    eager: Vec<(Arc<Window>, usize)>,
+    /// Their ranges, for the upload ahead of the submission.
+    named: Vec<(usize, usize)>,
+    sent: bool,
+}
+
+impl Owning<'_> {
+    /// The submission was executed, and `value` is signalled on the host's
+    /// fence behind it: its pages are the card's, their title memory
+    /// `PAGE_NOACCESS`.
+    pub(crate) fn sent(mut self, value: u64) {
+        self.sent = true;
+        let space = self.space;
+        for (window, page) in &self.pages {
+            let p = &window.pages[*page];
+            p.fence.store(value, Ordering::Release);
+            let state = p.state.load(Ordering::Acquire);
+            if state & PENDING != 0 {
+                let at = window.base + *page as u64 * PAGE;
+                protect(at, PAGE, PAGE_NOACCESS);
+                p.state.fetch_and(!PENDING, Ordering::AcqRel);
+                p.state.fetch_or(CARD, Ordering::AcqRel);
+                space.add(S::Owned, 1);
+            }
+        }
+        space.add(S::PagesWritten, self.pages.len() as u64);
+        let eager = std::mem::take(&mut self.eager);
+        if !eager.is_empty() {
+            // Memory that could not be protected: fetched as soon as the
+            // card is done, on this thread (the lock is held: nothing of
+            // this space's changes meanwhile).
+            for (window, page) in &eager {
+                window.pages[*page].fence.store(value, Ordering::Release);
+            }
+            space.add(S::Eager, eager.len() as u64);
+            space.fetch_now(&eager, value);
+        }
     }
+}
+
+impl Drop for Owning<'_> {
+    fn drop(&mut self) {
+        SUBMITTING.with(|s| s.set(false));
+        if !self.sent {
+            // Not sent: the pages stay the CPU's.
+            for (window, page) in &self.pages {
+                let p = &window.pages[*page];
+                if p.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
+                    protect(window.base + *page as u64 * PAGE, PAGE, PAGE_READWRITE);
+                    self.space.owned.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+    }
+}
+
+use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE};
+
+/// Sets the protection of `[at, at + len)`; the one it had, or `None` if
+/// the call failed.
+fn protect(at: u64, len: u64, protection: PAGE_PROTECTION_FLAGS) -> Option<PAGE_PROTECTION_FLAGS> {
+    let mut old = 0;
+    // SAFETY: changes a protection of title memory.
+    (unsafe { windows_sys::Win32::System::Memory::VirtualProtect(at as *const _, len as usize, protection, &mut old) } != 0)
+        .then_some(old)
+}
+
+/// Whether `[at, at + PAGE)` is plain write-watched read-write memory, all
+/// of it committed: what the card can own (its protection is ours to
+/// change, and writes to it are seen).
+fn ownable(at: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0
+        || info.State != MEM_COMMIT
+        || info.Protect != PAGE_READWRITE
+        || (info.BaseAddress as u64).saturating_add(info.RegionSize as u64) < at + PAGE
+    {
+        return false;
+    }
+    let mut found = [0usize; 16];
+    let (mut count, mut granularity) = (found.len(), 0u32);
+    // SAFETY: room for `count` entries; bits only read, not reset.
+    unsafe { GetWriteWatch(0, at as *const _, PAGE as usize, found.as_mut_ptr().cast(), &mut count, &mut granularity) == 0 }
 }
 
 impl Space {
@@ -409,6 +689,11 @@ impl Space {
             given: Mutex::new(Vec::new()),
             ring: Mutex::new(Vec::new()),
             stats: [const { AtomicU64::new(0) }; STATS_LEN],
+            gpu: false,
+            owning: Mutex::new(()),
+            owned: AtomicU64::new(0),
+            fence: Mutex::new(None),
+            fetch: Mutex::new(None),
         })
     }
 
@@ -440,7 +725,8 @@ impl Space {
             Format: DXGI_FORMAT_UNKNOWN,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_NONE,
+            // Shaders write it with `VICTORY_FLAT=2`.
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         };
         let mut made: Option<ID3D12Resource> = None;
         // SAFETY: a plain creation; the out pointer is ours.
@@ -521,6 +807,14 @@ impl Space {
 
     /// See [`find`].
     pub(crate) fn find(&self, address: u64, len: u64) -> Option<Arc<Shadow>> {
+        self.find_as(address, len, false)
+    }
+
+    /// [`find`], or with `write` [`find_write`].
+    pub(crate) fn find_as(&self, address: u64, len: u64, write: bool) -> Option<Arc<Shadow>> {
+        if write && !self.gpu {
+            return None;
+        }
         if address == 0 {
             return None;
         }
@@ -530,7 +824,7 @@ impl Space {
             return None;
         }
         let first = window.page(address);
-        // A copy would start on 256 bytes too (see `ALIGNED`): the copy
+        // A copy would start on 16 bytes too (see `ALIGNED`): the copy
         // `lookup` finds holds the address, so it lies on this page.
         if self.layout(window, first) & ALIGNED == 0 {
             self.add(S::ToCopiesUnaligned, 1);
@@ -544,6 +838,10 @@ impl Space {
         let last = window.page(end - 1);
         if window.pages[first..=last].iter().any(|p| p.state.load(Ordering::Acquire) & GPU != 0) {
             self.add(S::ToCopiesWritten, 1);
+            return None;
+        }
+        if write && !(first..=last).all(|page| self.can_own(window, page)) {
+            self.add(S::ToCopiesNotOwnable, 1);
             return None;
         }
         if !self.give(window, first, last) {
@@ -609,6 +907,11 @@ impl Space {
     /// See [`gpu_wrote`].
     pub(crate) fn gpu_wrote(&self, address: u64, len: u64) {
         let end = address.saturating_add(len.max(1));
+        // What the card owns there goes back to title memory first: the
+        // copies take it from there.
+        if self.owned.load(Ordering::Acquire) != 0 {
+            self.need(address, end);
+        }
         let mut at = address;
         let mut evicted = 0u64;
         while at < end {
@@ -631,6 +934,349 @@ impl Space {
         }
     }
 
+    /// Makes the space one that faults are looked up in ([`fault`]): it
+    /// lives for good.
+    pub(crate) fn take_faults(&'static self) {
+        crate::watch::install();
+        for slot in &FAULT_SPACES {
+            let me = std::ptr::from_ref(self).cast_mut();
+            match slot.compare_exchange(std::ptr::null_mut(), me, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(other) if other == me => return,
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Whether the card can own page `page` of `window` ([`ownable`],
+    /// noted; a page it owns can).
+    fn can_own(&self, window: &Window, page: usize) -> bool {
+        let p = &window.pages[page];
+        let state = p.state.load(Ordering::Acquire);
+        if state & (OWNABLE | CARD | PENDING | RESOLVING) != 0 {
+            return true;
+        }
+        if state & NOT_OWNABLE != 0 {
+            return false;
+        }
+        let yes = ownable(window.base + page as u64 * PAGE);
+        p.state.fetch_or(if yes { OWNABLE } else { NOT_OWNABLE }, Ordering::AcqRel);
+        yes
+    }
+
+    /// The runtime mapped, unmapped or committed `[address, address +
+    /// len)`: its pages are sent again, and what the card owned there is
+    /// let go (the memory is another now; our protection went with it).
+    fn forget(&self, address: u64, len: u64) {
+        self.each_page(address, len, |page| {
+            page.sent.store(0, Ordering::Release);
+            let state = page.state.fetch_and(!(CARD | PENDING | RESOLVING | OWNABLE | NOT_OWNABLE), Ordering::AcqRel);
+            if state & (CARD | PENDING) != 0 {
+                self.owned.fetch_sub(1, Ordering::AcqRel);
+            }
+        });
+    }
+
+    /// Before a submission is sent: the pages of `written` (shaders write
+    /// them) are protected read-only, so that what the title writes there
+    /// from now on faults and waits for the card, and the upload ahead of
+    /// the submission holds every byte the title wrote before. `None` if
+    /// nothing is written.
+    pub(crate) fn begin(&self, written: &[(usize, usize)]) -> Option<Owning<'_>> {
+        if written.is_empty() || !self.gpu {
+            return None;
+        }
+        let lock = self.owning.lock().unwrap_or_else(|e| e.into_inner());
+        SUBMITTING.with(|s| s.set(true));
+        let mut owning = Owning { space: self, _lock: lock, pages: Vec::new(), eager: Vec::new(), named: Vec::new(), sent: false };
+        let mut seen = HashSet::new();
+        for (a, e) in page_runs(written.iter().map(|&(a, n)| (a as u64, (a + n.max(1)) as u64)).collect()) {
+            for number in a..e {
+                let Some(window) = self.window_made(number * PAGE).cloned() else {
+                    continue;
+                };
+                if !seen.insert(number) {
+                    continue;
+                }
+                let page = window.page(number * PAGE);
+                if page >= window.pages.len() {
+                    continue;
+                }
+                let p = &window.pages[page];
+                let state = p.state.load(Ordering::Acquire);
+                if state & (CARD | RESOLVING) != 0 {
+                    owning.pages.push((window, page));
+                    continue;
+                }
+                let at = number * PAGE;
+                owning.named.push((at as usize, PAGE as usize));
+                if protect(at, PAGE, PAGE_READONLY) == Some(PAGE_READWRITE) {
+                    p.state.fetch_or(PENDING, Ordering::AcqRel);
+                    self.owned.fetch_add(1, Ordering::AcqRel);
+                    owning.pages.push((window, page));
+                } else {
+                    // Not plain read-write memory: left as it was, and its
+                    // bytes fetched once the card is done.
+                    protect(at, PAGE, PAGE_READWRITE);
+                    owning.eager.push((window, page));
+                }
+            }
+        }
+        Some(owning)
+    }
+
+    /// See [`need`].
+    fn need(&self, from: u64, to: u64) {
+        let mut pages = Vec::new();
+        let mut at = from / PAGE * PAGE;
+        while at < to {
+            if let Some(window) = self.window_made(at) {
+                let page = window.page(at);
+                // (A page being made the card's is read-only meanwhile: our
+                // own reads of it, the upload's, need nothing.)
+                let mine = if SUBMITTING.with(std::cell::Cell::get) { CARD | RESOLVING } else { CARD | PENDING | RESOLVING };
+                if page < window.pages.len() && window.pages[page].state.load(Ordering::Acquire) & mine != 0 {
+                    pages.push((window.clone(), page));
+                }
+            }
+            at += PAGE;
+        }
+        if pages.is_empty() {
+            return;
+        }
+        if SUBMITTING.with(std::cell::Cell::get) {
+            self.add(S::NotTaken, pages.len() as u64);
+            return;
+        }
+        let started = std::time::Instant::now();
+        let n = pages.len() as u64;
+        if self.resolve(pages, false) {
+            self.add(S::Needed, n);
+        }
+        self.add(S::FetchUs, started.elapsed().as_micros() as u64);
+    }
+
+    /// See [`fault`]: `None` if the address is not a page of this space the
+    /// card owns.
+    fn fault(&self, at: u64, write: bool) -> Option<bool> {
+        let window = self.window_made(at)?;
+        let page = window.page(at);
+        let state = window.pages.get(page)?.state.load(Ordering::Acquire);
+        if state & (CARD | PENDING | RESOLVING) == 0 {
+            return None;
+        }
+        if SUBMITTING.with(std::cell::Cell::get) {
+            self.add(S::NotTaken, 1);
+            return Some(false);
+        }
+        let started = std::time::Instant::now();
+        let taken = self.resolve(vec![(window.clone(), page)], write);
+        self.add(S::Faulted, 1);
+        self.add(S::FetchUs, started.elapsed().as_micros() as u64);
+        Some(taken)
+    }
+
+    /// The owning lock, waited for [`WAIT_LIMIT`] at most.
+    fn lock_owning(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let waiting = std::time::Instant::now();
+        loop {
+            match self.owning.try_lock() {
+                Ok(lock) => return Some(lock),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if waiting.elapsed() > WAIT_LIMIT {
+                        self.add(S::NotTaken, 1);
+                        return None;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// Fetches the pages the card owns among `pages` back into title
+    /// memory: their fence values are taken under the lock, the wait and
+    /// the copy are made without it, and the bytes go in under it again if
+    /// no submission wrote the page since (else again, behind that one).
+    /// `write`: a CPU write is waiting (counted towards [`touches_most`]).
+    /// False if a wait went past [`WAIT_LIMIT`].
+    fn resolve(&self, mut pages: Vec<(Arc<Window>, usize)>, write: bool) -> bool {
+        let waiting = std::time::Instant::now();
+        loop {
+            let taken: Vec<(Arc<Window>, usize, u64)> = {
+                let Some(_lock) = self.lock_owning() else {
+                    return false;
+                };
+                pages
+                    .drain(..)
+                    .filter_map(|(window, page)| {
+                        let p = &window.pages[page];
+                        let state = p.state.load(Ordering::Acquire);
+                        if state & (CARD | RESOLVING) == 0 {
+                            return None;
+                        }
+                        p.state.fetch_or(RESOLVING, Ordering::AcqRel);
+                        let fence = p.fence.load(Ordering::Acquire);
+                        Some((window, page, fence))
+                    })
+                    .collect()
+            };
+            if taken.is_empty() {
+                return true;
+            }
+            let value = taken.iter().map(|t| t.2).max().unwrap_or(0);
+            if !self.wait_host(value, waiting) {
+                return false;
+            }
+            let Some(bytes) = self.download(&taken) else {
+                return false;
+            };
+            let Some(_lock) = self.lock_owning() else {
+                return false;
+            };
+            for (i, (window, page, fence)) in taken.into_iter().enumerate() {
+                let p = &window.pages[page];
+                if p.fence.load(Ordering::Acquire) != fence || p.state.load(Ordering::Acquire) & CARD == 0 {
+                    // Written again by a later submission (or let go):
+                    // fetched again behind it, if still the card's.
+                    pages.push((window, page));
+                    continue;
+                }
+                let at = window.base + page as u64 * PAGE;
+                protect(at, PAGE, PAGE_READWRITE);
+                // SAFETY: the page is the title's, read-write now; the
+                // fetched bytes are one page.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes[i * PAGE as usize..].as_ptr(), at as *mut u8, PAGE as usize);
+                }
+                // Every other copy of these bytes takes them again; the
+                // mirror holds them already (the write-watch bits our copy
+                // set make it send the page once more, which costs a page
+                // and loses nothing).
+                let (_, now) = crate::watch::wrote_own((at / PAGE) as usize, &[]);
+                p.sent.store(now, Ordering::Release);
+                p.state.fetch_and(!(CARD | RESOLVING), Ordering::AcqRel);
+                self.owned.fetch_sub(1, Ordering::AcqRel);
+                let most = touches_most();
+                if write && most > 0 && p.touches.fetch_add(1, Ordering::AcqRel) + 1 >= most {
+                    // The CPU keeps writing it: the copies take it from now
+                    // on (what shows the mirror there is made again).
+                    if p.state.fetch_or(GPU, Ordering::AcqRel) & GPU == 0 {
+                        self.add(S::TouchedOut, 1);
+                        EVICTIONS.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+            }
+            if pages.is_empty() {
+                return true;
+            }
+        }
+    }
+
+    /// Pages that could not be protected: the caller holds the lock and
+    /// has just sent the submission behind `value`; waits for it and puts
+    /// their bytes into title memory.
+    fn fetch_now(&self, pages: &[(Arc<Window>, usize)], value: u64) {
+        if !self.wait_host(value, std::time::Instant::now()) {
+            return;
+        }
+        let taken: Vec<(Arc<Window>, usize, u64)> = pages.iter().map(|(w, p)| (w.clone(), *p, value)).collect();
+        let Some(bytes) = self.download(&taken) else {
+            return;
+        };
+        for (i, (window, page, _)) in taken.into_iter().enumerate() {
+            let at = window.base + page as u64 * PAGE;
+            crate::host::write_mapped(at as *mut u8, bytes[i * PAGE as usize..].as_ptr(), PAGE as usize);
+            let (_, now) = crate::watch::wrote_own((at / PAGE) as usize, &[]);
+            window.pages[page].sent.store(now, Ordering::Release);
+        }
+    }
+
+    /// Waits until the host's fence has passed `value` (from `since`, at
+    /// most [`WAIT_LIMIT`]).
+    fn wait_host(&self, value: u64, since: std::time::Instant) -> bool {
+        let Some(fence) = self.fence.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return false;
+        };
+        loop {
+            // SAFETY: a plain query.
+            if unsafe { fence.GetCompletedValue() } >= value {
+                return true;
+            }
+            if since.elapsed() > WAIT_LIMIT {
+                self.add(S::NotTaken, 1);
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// The bytes of the pages (one page each, in order) as the card holds
+    /// them now, through the fetch's copy queue.
+    fn download(&self, pages: &[(Arc<Window>, usize, u64)]) -> Option<Vec<u8>> {
+        let total = pages.len() as u64 * PAGE;
+        let mut fetch = self.fetch.lock().unwrap_or_else(|e| e.into_inner());
+        if fetch.as_ref().is_none_or(|f| f.size < total) {
+            *fetch = self.make_fetch(total.next_power_of_two().max(16 * PAGE));
+        }
+        let f = fetch.as_mut()?;
+        // SAFETY: the fetch's own objects; its last list was waited for;
+        // live buffers, the pages lie in them.
+        unsafe {
+            f.allocator.Reset().ok()?;
+            f.list.Reset(&f.allocator, None).ok()?;
+            for (i, (window, page, _)) in pages.iter().enumerate() {
+                f.list.CopyBufferRegion(&f.readback, i as u64 * PAGE, &window.resource, *page as u64 * PAGE, PAGE);
+            }
+            f.list.Close().ok()?;
+            f.queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&f.list).ok()?)]);
+            f.value += 1;
+            f.queue.Signal(&f.fence, f.value).ok()?;
+            f.fence.SetEventOnCompletion(f.value, f.event).ok()?;
+            use windows::Win32::System::Threading::WaitForSingleObject;
+            if WaitForSingleObject(f.event, WAIT_LIMIT.as_millis() as u32) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                self.add(S::NotTaken, 1);
+                return None;
+            }
+            Some(std::slice::from_raw_parts(f.data, total as usize).to_vec())
+        }
+    }
+
+    fn make_fetch(&self, size: u64) -> Option<Fetch> {
+        // SAFETY: plain object creation and a map of the read-back buffer.
+        unsafe {
+            let queue: ID3D12CommandQueue = self
+                .device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
+                .ok()?;
+            let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
+            let list: ID3D12GraphicsCommandList =
+                self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).ok()?;
+            list.Close().ok()?;
+            let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).ok()?;
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut readback: Option<ID3D12Resource> = None;
+            self.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback)
+                .ok()?;
+            let readback = readback?;
+            let mut data = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut data)).ok()?;
+            Some(Fetch { queue, allocator, list, fence, value: 0, event, readback, data: data.cast(), size })
+        }
+    }
+
     /// The windows' buffers, as raw interface pointers.
     fn window_raws(&self) -> Vec<usize> {
         use windows::core::Interface;
@@ -640,7 +1286,7 @@ impl Space {
     /// See [`submit`]. Returns the pages sent.
     pub(crate) fn upload(&self, queue: &ID3D12CommandQueue, fence: &ID3D12Fence, next: u64, ranges: &[(usize, usize)]) -> u64 {
         let started = std::time::Instant::now();
-        self.map_given(queue);
+        let _ = self.fence.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| fence.clone());
         // The pages named, in order, none touching another, and cut at the
         // windows' lines.
         let mut named: Vec<(u64, u64)> = Vec::new();
@@ -653,6 +1299,16 @@ impl Space {
                 at = to;
             }
         }
+        // A refresh may name pages its ask did not give tiles to (the
+        // buffer an ask without a length runs to grew since): they get
+        // theirs now, ahead of the mapping.
+        for &(a, e) in &named {
+            if let Some(window) = self.window_made(a * PAGE) {
+                let (first, last) = (window.page(a * PAGE), window.page((e - 1) * PAGE));
+                let _ = self.give(window, first, last);
+            }
+        }
+        self.map_given(queue);
         if named.is_empty() {
             return 0;
         }
@@ -660,14 +1316,15 @@ impl Space {
         // One asking for runs close together (`crate::watch::ask_ahead`).
         let bytes: Vec<(usize, usize)> = named.iter().map(|&(a, e)| ((a * PAGE) as usize, (e * PAGE) as usize)).collect();
         crate::watch::ask_ahead(&bytes);
+        // Every run's answer at once, under one lock of the journal.
+        let answers = crate::watch::writes_many(&bytes);
         // The pages to send, as runs of title addresses, each in one window.
         let mut send: Vec<(Arc<Window>, u64, u64)> = Vec::new();
-        for &(a, e) in &named {
+        for (&(a, e), answer) in named.iter().zip(answers) {
             let Some(window) = self.window_made(a * PAGE).cloned() else {
                 self.add(S::PagesWithoutTiles, e - a);
                 continue;
             };
-            let answer = crate::watch::writes((a * PAGE) as usize, (e * PAGE) as usize, true);
             let mut written = answer.as_ref().map_or(&[][..], |(_, w)| &w[..]).iter().peekable();
             let now = answer.as_ref().map_or(0, |(now, _)| *now);
             for number in a..e {
@@ -679,9 +1336,16 @@ impl Space {
                     _ => 0,
                 };
                 let page = &window.pages[window.page(number * PAGE)];
-                let state = page.state.fetch_or(USED, Ordering::Relaxed);
+                let state = page.state.load(Ordering::Relaxed);
+                if state & USED == 0 {
+                    page.state.fetch_or(USED, Ordering::Relaxed);
+                }
                 if state & MAPPED == 0 {
                     self.add(S::PagesWithoutTiles, 1);
+                    continue;
+                }
+                // The card owns it: the mirror is newer than title memory.
+                if state & (CARD | RESOLVING) != 0 {
                     continue;
                 }
                 let sent = page.sent.load(Ordering::Acquire);
@@ -698,6 +1362,7 @@ impl Space {
             }
         }
         crate::watch::ask_ahead_done();
+        self.add(S::ScanUs, started.elapsed().as_micros() as u64);
         if send.is_empty() {
             self.add(S::SendUs, started.elapsed().as_micros() as u64);
             return 0;
@@ -791,6 +1456,19 @@ impl Space {
             }
         };
         let slot = &mut ring[at];
+        if slot.timed
+            && let Some((_, _, stamps)) = &slot.stamps
+        {
+            // SAFETY: the read-back's two timestamps; the card finished the
+            // list (its fence passed).
+            let (a, b) = unsafe { (stamps.read_volatile(), stamps.add(1).read_volatile()) };
+            // SAFETY: a plain query.
+            let frequency = unsafe { queue.GetTimestampFrequency() }.unwrap_or(0);
+            if b > a && frequency > 0 {
+                self.add(S::CardUs, (b - a) * 1_000_000 / frequency);
+            }
+            slot.timed = false;
+        }
         // Upload memory of at least `total` bytes; a large one is not kept
         // for small sends.
         let fits = slot.staging.as_ref().is_some_and(|s| s.2 >= total && (s.2 <= 64 << 20 || total > 16 << 20));
@@ -805,6 +1483,7 @@ impl Space {
         let Some((staging, data, _)) = slot.staging.clone() else {
             return false;
         };
+        let copying = std::time::Instant::now();
         let mut offset = 0u64;
         for (_, a, e) in runs {
             // SAFETY: inside the upload mapping (`total` bytes at least).
@@ -812,16 +1491,25 @@ impl Space {
             crate::host::copy_mapped(to, *a as *const u8, (*e - *a) as usize, false);
             offset += *e - *a;
         }
+        self.add(S::CopyUs, copying.elapsed().as_micros() as u64);
         // SAFETY: the slot's list ran (the fence passed it); live buffers,
         // the runs lie in them.
         let recorded = unsafe {
             (|| -> windows::core::Result<()> {
                 slot.allocator.Reset()?;
                 slot.list.Reset(&slot.allocator, None)?;
+                if let Some((heap, _, _)) = &slot.stamps {
+                    slot.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                }
                 let mut offset = 0u64;
                 for (window, a, e) in runs {
                     slot.list.CopyBufferRegion(&window.resource, *a - window.base, &staging, offset, *e - *a);
                     offset += *e - *a;
+                }
+                if let Some((heap, back, _)) = &slot.stamps {
+                    slot.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    slot.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, back, 0);
+                    slot.timed = true;
                 }
                 slot.list.Close()?;
                 queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&slot.list)?)]);
@@ -843,7 +1531,33 @@ impl Space {
             let list: ID3D12GraphicsCommandList =
                 self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
             list.Close().ok()?;
-            Some(Slot { allocator, list, staging: None, fence: 0 })
+            // The timestamps (none if the card will not have them).
+            let stamps = (|| {
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                self.device
+                    .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut heap)
+                    .ok()?;
+                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 16,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut back: Option<ID3D12Resource> = None;
+                self.device
+                    .CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back)
+                    .ok()?;
+                let back = back?;
+                let mut mapped = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut mapped)).ok()?;
+                Some((heap?, back, mapped.cast_const().cast::<u64>()))
+            })();
+            Some(Slot { allocator, list, staging: None, fence: 0, stamps, timed: false })
         }
     }
 
@@ -952,11 +1666,12 @@ fn mirror_line(frames: f64) {
     let mb = |bytes: u64| bytes as f64 / f64::from(1 << 20);
     let f = |i: S| s[i as usize] as f64 / frames;
     tracing::info!(
-        "flat mirror (VICTORY_FLAT=1) per frame: {:.0} asks taken, to the copies {:.1} written by shaders, {:.1} unaligned, \
+        "flat mirror (VICTORY_FLAT={}) per frame: {:.0} asks taken, to the copies {:.1} written by shaders, {:.1} unaligned, \
          {:.1} across a window, {:.1} without tiles; sent {:.0} pages ({:.1} MB) in {:.0} runs over {:.1} submissions, {:.2} ms; \
          {:.0} pages named, {:.1} without tiles; UpdateTileMappings {:.1} calls {:.0} us; {:.1} pages left to the copies, \
          {:.2} shader writes into the mirror (lost); now: {windows} windows, {:.0} MB with tiles ({:.0} MB of heaps, budget \
          {:.0} MB{}), {:.0} MB the copies', {:.0} MB named since the last line",
+        mode() - 1,
         f(S::Served),
         f(S::ToCopiesWritten),
         f(S::ToCopiesUnaligned),
@@ -979,6 +1694,22 @@ fn mirror_line(frames: f64) {
         if space.exhausted.load(Ordering::Relaxed) { ", used up" } else { "" },
         mb(copies * PAGE),
         mb(used * PAGE),
+    );
+    tracing::info!(
+        "flat mirror per frame, its parts: the send's looking for written pages {:.2} ms and copying {:.2} ms, the card's          copies into the windows {:.2} ms; shader writes          (VICTORY_FLAT=2): {:.0} pages written in the mirror, {:.1} came to be the card's, fetched back {:.1} by a touch and          {:.1} by our readers in {:.2} ms, {:.2} left the mirror after CPU writes, {:.1} asks to the copies (memory the card          cannot own), {:.1} fetched at once (not protectable), {:.2} touches not taken; owned now {} pages",
+        f(S::ScanUs) / 1000.0,
+        f(S::CopyUs) / 1000.0,
+        f(S::CardUs) / 1000.0,
+        f(S::PagesWritten),
+        f(S::Owned),
+        f(S::Faulted),
+        f(S::Needed),
+        f(S::FetchUs) / 1000.0,
+        f(S::TouchedOut),
+        f(S::ToCopiesNotOwnable),
+        f(S::Eager),
+        f(S::NotTaken),
+        space.owned.load(Ordering::Relaxed),
     );
 }
 
@@ -1685,6 +2416,185 @@ mod mirror_tests {
         crate::shadow::unregister(0xF1A7_0001, start);
         drop(copy);
         // SAFETY: our allocation; the copy is gone.
+        unsafe { VirtualFree(memory.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// A compute program that stores a dword (`constants[1]`) at a byte
+    /// offset (`constants[0]`) of a root unordered access view.
+    const STORE: &str = r#"
+#define RS "UAV(u0), RootConstants(num32BitConstants = 2, b0)"
+RWByteAddressBuffer words : register(u0);
+cbuffer Constants : register(b0) { uint at; uint value; };
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void store() {
+    words.Store(at, value);
+}
+"#;
+
+    /// A space shaders write, that faults are looked up in (it lives for
+    /// good, as the host's does).
+    fn writing_space(rig: &Rig) -> &'static Space {
+        let mut space = Space::with_bits(&rig.device, 64, BITS).expect("the software adapter holds the mirror");
+        space.gpu = true;
+        let space: &'static Space = Box::leak(Box::new(space));
+        space.take_faults();
+        space
+    }
+
+    /// Write-watched memory of two pages; its first whole page, filled with
+    /// `fill`.
+    fn one_page(fill: u8) -> (*mut u8, u64) {
+        let len = 2 * PAGE as usize;
+        // SAFETY: a plain allocation.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+        assert!(!memory.is_null());
+        let page = (memory as u64).div_ceil(PAGE) * PAGE;
+        // SAFETY: inside the allocation.
+        unsafe { std::ptr::write_bytes(page as *mut u8, fill, PAGE as usize) };
+        (memory, page)
+    }
+
+    struct Store {
+        root: ID3D12RootSignature,
+        pso: ID3D12PipelineState,
+    }
+
+    fn store_program(rig: &Rig) -> Store {
+        let code = crate::host::compile(STORE, windows::core::s!("store"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        // SAFETY: the shader's own root signature; plain creation.
+        unsafe {
+            let root: ID3D12RootSignature = rig.device.CreateRootSignature(0, &code).unwrap();
+            let pso = rig
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            Store { root, pso }
+        }
+    }
+
+    /// One submission as `Host::submit` makes it: the pages its shaders
+    /// write are protected and sent, a list stores `value` at `page + at`
+    /// in the mirror (behind `gate` reaching 1, if given), and the pages
+    /// are the card's once it is executed. Not waited for.
+    fn store_submission(rig: &mut Rig, space: &Space, program: &Store, page: u64, at: u32, value: u32, gate: Option<&ID3D12Fence>) -> (ID3D12CommandAllocator, ID3D12GraphicsCommandList) {
+        let window = space.find_as(page, 256, true).expect("the mirror takes the write");
+        let owning = space.begin(&[(page as usize, 256)]).expect("pages written");
+        let mut ranges = vec![(page as usize, 256)];
+        ranges.extend(owning.named.iter().copied());
+        space.upload(&rig.queue, &rig.fence, rig.value + 1, &ranges);
+        // SAFETY: plain creation; an open list; live buffers; our queue.
+        unsafe {
+            if let Some(gate) = gate {
+                rig.queue.Wait(gate, 1).unwrap();
+            }
+            let allocator: ID3D12CommandAllocator = rig.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = rig.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            list.SetComputeRootSignature(&program.root);
+            list.SetPipelineState(&program.pso);
+            list.SetComputeRootUnorderedAccessView(0, window.gpu(page));
+            let constants = [at, value];
+            list.SetComputeRoot32BitConstants(1, 2, constants.as_ptr().cast(), 0);
+            list.Dispatch(1, 1, 1);
+            list.Close().unwrap();
+            rig.queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).unwrap())]);
+            rig.value += 1;
+            rig.queue.Signal(&rig.fence, rig.value).unwrap();
+            owning.sent(rig.value);
+            (allocator, list)
+        }
+    }
+
+    fn dword(page: u64, at: u64) -> u32 {
+        // SAFETY: title memory of the test (a touch may fault and be taken).
+        unsafe { ((page + at) as *const u32).read_volatile() }
+    }
+
+    #[test]
+    fn what_shaders_write_in_the_mirror_reaches_the_cpu_when_it_reads() {
+        let Some(mut rig) = Rig::new() else {
+            eprintln!("flat mirror_tests: skipped, no software adapter");
+            return;
+        };
+        let space = writing_space(&rig);
+        let program = store_program(&rig);
+        let (memory, page) = one_page(0x11);
+        let _list = store_submission(&mut rig, space, &program, page, 16, 0xC0DE_0001, None);
+        assert!(space.owned.load(Ordering::Acquire) >= 1, "the card owns the page");
+        // The CPU reads: the page comes back, the shader's dword in it.
+        assert_eq!(dword(page, 16), 0xC0DE_0001);
+        assert_eq!(dword(page, 0), 0x1111_1111);
+        assert_eq!(dword(page, PAGE - 4), 0x1111_1111);
+        assert_eq!(space.owned.load(Ordering::Acquire), 0);
+        let stats = space.take_stats();
+        assert_eq!(stats[S::Faulted as usize], 1);
+        assert_eq!(stats[S::Owned as usize], 1);
+        rig.finish();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(memory.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_cpu_write_between_two_submissions_joins_what_shaders_wrote() {
+        let Some(mut rig) = Rig::new() else {
+            eprintln!("flat mirror_tests: skipped, no software adapter");
+            return;
+        };
+        let space = writing_space(&rig);
+        let program = store_program(&rig);
+        let (memory, page) = one_page(0x22);
+        let _first = store_submission(&mut rig, space, &program, page, 0, 0x0000_00A1, None);
+        // The CPU writes the page the card owns: it comes back first, then
+        // the write goes on.
+        // SAFETY: title memory of the test.
+        unsafe { ((page + 8) as *mut u32).write_volatile(0x0000_00B2) };
+        // The second submission's shaders write another dword; its upload
+        // takes the CPU's write.
+        let _second = store_submission(&mut rig, space, &program, page, 32, 0x0000_00C3, None);
+        rig.finish();
+        let shown = rig.shown(space, page, 64);
+        let word = |at: usize| u32::from_le_bytes(shown[at..at + 4].try_into().unwrap());
+        assert_eq!(word(0), 0xA1, "the first submission's shader write");
+        assert_eq!(word(8), 0xB2, "the CPU's write between them");
+        assert_eq!(word(32), 0xC3, "the second submission's shader write");
+        assert_eq!(word(4), 0x2222_2222);
+        // And title memory has all three once read.
+        assert_eq!((dword(page, 0), dword(page, 8), dword(page, 32), dword(page, 12)), (0xA1, 0xB2, 0xC3, 0x2222_2222));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(memory.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_read_of_a_page_a_held_submission_writes_waits_for_it() {
+        let Some(mut rig) = Rig::new() else {
+            eprintln!("flat mirror_tests: skipped, no software adapter");
+            return;
+        };
+        let space = writing_space(&rig);
+        let program = store_program(&rig);
+        let (memory, page) = one_page(0x33);
+        // SAFETY: plain creation.
+        let gate: ID3D12Fence = unsafe { rig.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        let _held = store_submission(&mut rig, space, &program, page, 4, 0x5EED_0004, Some(&gate));
+        let opener = {
+            let gate = gate.clone();
+            let gate = std::sync::Mutex::new(gate);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                // SAFETY: our fence.
+                unsafe { gate.lock().unwrap().Signal(1) }.unwrap();
+            })
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(dword(page, 4), 0x5EED_0004, "the read waited for the card");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        opener.join().unwrap();
+        rig.finish();
+        // SAFETY: our allocation.
         unsafe { VirtualFree(memory.cast(), 0, MEM_RELEASE) };
     }
 }
