@@ -3757,9 +3757,14 @@ impl<'a> Lower<'a> {
             }
             // Read only by the wait that a zero entry word skips ([`enters_pops`]).
             Operand::Const(POPS_EXITING_WAVE_ID) if self.pops => Ok(self.s.m.i32(0)),
+            // src_scc: the scalar condition, 0 or 1.
+            Operand::Const(253) => {
+                let v = inst.read(Reg::Scc).ok_or("an unread operand")?;
+                self.i32_of(v)
+            }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
-                .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
+                .ok_or("a special operand (vccz, execz, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
         }
