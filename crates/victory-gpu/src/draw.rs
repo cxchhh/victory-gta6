@@ -432,6 +432,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// The tables of constant buffers the last `tables` made for the
+    /// stage's split tables (`victory_shader::emit::USER_CBV_TABLE`): root
+    /// parameter, byte offset of the first slot (`u32::MAX`: no slots).
+    cbv_tables: Vec<(u8, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -901,6 +905,9 @@ pub(crate) static VIEW_MARKS_EVICTED: AtomicU64 = AtomicU64::new(0);
 /// Constant buffer views of tables that could not be made in place (no host
 /// copy of their memory): their table was made afresh, since the start.
 pub(crate) static CBV_NOT_IN_PLACE: AtomicU64 = AtomicU64::new(0);
+/// Slots of the tables of constant buffers made for split tables, since
+/// the start (`State::cbv_table`).
+pub(crate) static CBV_SPLIT_SLOTS: AtomicU64 = AtomicU64::new(0);
 /// Frames a constant buffer view must have stayed in its title slot to be
 /// made in place (`HostHeap::cbv_stable`).
 const CBV_STABLE_FRAMES: u32 = 120;
@@ -1270,9 +1277,12 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_CBV_TABLE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_CBV_TABLE {
+            return self.cbv_tables.iter().find(|m| m.0 == slot).map_or(0, |m| m.1);
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1500,9 +1510,16 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let split: Vec<u8> = t
+                .host
+                .user_data
+                .iter()
+                .filter(|u| u.root == RootType::Other(victory_shader::emit::USER_CBV_TABLE))
+                .map(|u| u.slot)
+                .collect();
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, &split);
             STORES.set(true);
-            if made.iter().any(|m| m.1 == u32::MAX) {
+            if made.iter().chain(&self.cbv_tables).any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return not_bound("a descriptor table made afresh", slot_refusal());
             }
@@ -3371,6 +3388,68 @@ impl State {
         }
     }
 
+    /// The table of the constant buffers of the descriptor table of root
+    /// parameter `slot` (`victory_shader::emit::USER_CBV_TABLE`): its used
+    /// entries of kind CBV in the order of their offsets, copied for the
+    /// draw into dynamic slots (their constants into upload memory at
+    /// submission), once per list for the same records. Returns the byte
+    /// offset of its first slot; `u32::MAX` if there were no slots.
+    fn cbv_table(&mut self, list: &HostList, used: &[UsedResource], compute: bool, slot: u8) -> u32 {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return 0;
+        };
+        let mut cbvs: Vec<u32> = used
+            .iter()
+            .filter(|u| u.root == RootType::Table && u.slot == slot && u.kind == ResourceType::Cbv)
+            .map(|u| u.table_offset_dwords / 8)
+            .collect();
+        cbvs.sort_unstable();
+        cbvs.dedup();
+        let n = cbvs.len() as u32;
+        if n == 0 {
+            return 0;
+        }
+        let Some(heap) = self.heap_of(table) else { return 0 };
+        let Some(host) = heap.host() else { return 0 };
+        // The records of those entries (address, size: what is copied).
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for &k in &cbvs {
+                let at = table + u64::from(k) * 32;
+                // SAFETY: a descriptor slot in title memory.
+                unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                k.hash(&mut h);
+            }
+            (table | 1 << 63, n, h.finish())
+        };
+        if let Some(&first) = self.fresh_tables.get(&key) {
+            return first * 32;
+        }
+        let Some(first) = host.dynamic(n) else {
+            return u32::MAX;
+        };
+        self.fresh_tables.insert(key, first);
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, first, n));
+        for (j, &k) in cbvs.iter().enumerate() {
+            let index = first + j as u32;
+            match crate::descriptor::view(table + u64::from(k) * 32) {
+                Some(View::Constant(address, size)) => {
+                    let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        host.make_null(index);
+                        continue;
+                    };
+                    list.defer_fill(to, address as *const u8, size as usize);
+                    host.constant_at(index, gpu, size);
+                }
+                Some(view) => host.make_at(index, &view),
+                None => host.make_null(index),
+            }
+        }
+        CBV_SPLIT_SLOTS.fetch_add(u64::from(n), Ordering::Relaxed);
+        first * 32
+    }
+
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
@@ -3418,7 +3497,17 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
+        split: &[u8],
     ) -> Vec<(u8, u32)> {
+        // Split tables (`victory_shader::emit::USER_CBV_TABLE`): their
+        // constant buffers are copied into a table of their own for the
+        // draw; the shader reads the table's other views from the title's
+        // slots, so the table is not made afresh for holding one.
+        self.cbv_tables.clear();
+        for &slot in split {
+            let first = self.cbv_table(list, used, compute, slot);
+            self.cbv_tables.push((slot, first));
+        }
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         // (With constant buffer views made in place, the shaders adding the
         // rows the host's view begins early by: no longer for them.)
@@ -3428,6 +3517,7 @@ impl State {
             .filter(tables)
             .filter(|u| {
                 u.kind == ResourceType::Cbv
+                    && !split.contains(&u.slot)
                     && (!in_place || {
                         // In place only over memory the host keeps a copy
                         // of; a table with a constant buffer elsewhere is
@@ -3486,7 +3576,9 @@ impl State {
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            // (A split table's constant buffers are read from its own
+            // table of them, not from the title's slots.)
+            if !fresh.contains(&u.slot) && !(u.kind == ResourceType::Cbv && split.contains(&u.slot)) {
                 self.table_entry(list, u, compute);
             }
         }

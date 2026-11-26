@@ -118,7 +118,7 @@ pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_CBV_ROWS, SLOT_FAULTS, SLOT_MARKS, SLOT_MEMORY,
     SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, SLOT_VIEWS, SLOT_VIEWS_COUNT, USER_DATA_SPACE,
     USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    cbv_in_place, set_view_heap_limit, view_heap_limit, view_marks,
+    USER_CBV_TABLE, cbv_in_place, cbv_split, set_view_heap_limit, view_heap_limit, view_marks,
 };
 
 /// The loop limit without an override: 4096.
@@ -404,6 +404,15 @@ pub fn with_wave_wide<T>(f: impl FnOnce() -> T) -> T {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    match translate_first_half(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CBV_SPLIT_REFUSED => {
+            lower::without_cbv_split(|| translate_first_half(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_first_half(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))

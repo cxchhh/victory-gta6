@@ -1401,6 +1401,26 @@ thread_local! {
     static FIRST_HALF_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// Constant buffers of tables are read from tables of their own
+    /// (`shader::USER_CBV_TABLE`); off for a program's second translation
+    /// after [`CBV_SPLIT_REFUSED`].
+    static CBV_SPLIT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Why a program is translated again without split constant buffer tables:
+/// it picks a constant buffer out of a table at an offset it computes.
+pub(crate) const CBV_SPLIT_REFUSED: &str = "a constant buffer picked from a table at a computed offset";
+
+/// Runs `translate` with constant buffer tables not split
+/// ([`CBV_SPLIT_REFUSED`]).
+pub(super) fn without_cbv_split<R>(translate: impl FnOnce() -> R) -> R {
+    let before = CBV_SPLIT_OFF.replace(true);
+    let result = translate();
+    CBV_SPLIT_OFF.set(before);
+    result
+}
+
 /// Runs `translate` with first halves of interpolations evaluated as the
 /// pair they start: the translation of a program refused with
 /// [`FIRST_HALF`] (`VICTORY_FIRST_HALF=0`: refused again, as before).
@@ -7246,6 +7266,16 @@ impl<'a> Lower<'a> {
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
+                // A constant buffer of a table: from the draw's table of
+                // the table's constant buffers (`shader::USER_CBV_TABLE`).
+                if !sampler && props.0 == 13 && !CBV_SPLIT_OFF.get() && super::shader::cbv_split()
+                    && super::shader::view_heap_limit() != 0
+                    && let Some(index) = self.cbv_split_index(*load, *first)?
+                {
+                    let h = self.s.heap_handle(self.cur, index, false, false, props);
+                    self.handles.insert(key, h);
+                    return Ok(h);
+                }
                 let index = self.heap_index(*load, *first, sampler)?;
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
@@ -7735,6 +7765,46 @@ impl<'a> Lower<'a> {
 
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
+    /// The heap slot of the constant buffer the descriptor load at `load`
+    /// reads from a table, in the draw's table of that table's constant
+    /// buffers (`shader::USER_CBV_TABLE`): `None` if the load is not from
+    /// a table; refused ([`CBV_SPLIT_REFUSED`]) at an offset the program
+    /// computes, or one no constant buffer entry of the table names.
+    fn cbv_split_index(&mut self, load: Site, first: u8) -> Result<Option<V>, Why> {
+        let Some(a) = self.scalar.get(&load).copied() else {
+            return Ok(None);
+        };
+        let Some(rp) = self.x.native.layout.get(a.param).copied() else {
+            return Ok(None);
+        };
+        if rp.root != RootType::Table {
+            return Ok(None);
+        }
+        if a.dynamic.is_some() {
+            return Err(CBV_SPLIT_REFUSED);
+        }
+        let dword = a.offset / 4 + u32::from(first);
+        let mut cbvs: Vec<u32> = self
+            .x
+            .native
+            .used
+            .iter()
+            .filter(|u| u.root == RootType::Table && u.user_data == rp.user_data && u.kind == ResourceType::Cbv)
+            .map(|u| u.table_offset_dwords / 8)
+            .collect();
+        cbvs.sort_unstable();
+        cbvs.dedup();
+        let Some(rank) = cbvs.iter().position(|&s| s == dword / 8) else {
+            return Err(CBV_SPLIT_REFUSED);
+        };
+        let word = self.host_word(RootType::Other(super::shader::USER_CBV_TABLE), rp.slot, 0);
+        let c = self.cur;
+        let five = self.s.m.i32(5);
+        let base = self.s.m.bin(c, Bin::LShr, word, five);
+        let k = self.s.m.i32(rank as u32);
+        Ok(Some(self.s.m.bin(c, Bin::Add, base, k)))
+    }
+
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
         let a = *self
             .scalar
