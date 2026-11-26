@@ -6383,6 +6383,23 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::trace::wanted() {
+            let ranges: Vec<(usize, usize)> = runs
+                .iter()
+                .flat_map(|l| {
+                    l.deferred()
+                        .copies
+                        .iter()
+                        .filter_map(|s| match s {
+                            Step::Refresh(_, a, n) => Some((*a, *n)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let lists: Vec<usize> = runs.iter().map(|l| crate::trace::list_id(l)).collect();
+            crate::trace::submitting(&lists, &ranges, late);
+        }
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
@@ -8885,6 +8902,8 @@ fn fills_plain() -> bool {
 /// at `dst`. In place if it is short and [`fills_plain`] says so, else (and
 /// if a source page was not there) as every copy ([`copy_mapped`]).
 fn copy_fill(dst: *mut u8, src: *const u8, len: usize) {
+    // Card bytes kept for later there go in first (`crate::lazy`).
+    crate::lazy::need(src as usize, src as usize + len);
     #[cfg(feature = "diagnostics")]
     let timing_only = crate::copystat::mode() != 0;
     #[cfg(not(feature = "diagnostics"))]
@@ -8924,6 +8943,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     if len == 0 {
         return;
+    }
+    // Card bytes kept for later in the source, or under a title
+    // destination, go in first (`crate::lazy`): the kernel's copy fails on
+    // their pages, and a destination's new bytes land over them.
+    crate::lazy::need(src as usize, src as usize + len);
+    if title_dst {
+        crate::lazy::need(dst as usize, dst as usize + len);
     }
     #[cfg(feature = "diagnostics")]
     {
@@ -9033,6 +9059,8 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    // Card bytes kept for later there go in first (`crate::lazy`).
+    crate::lazy::need(src as usize, src as usize + dst.len());
     #[cfg(feature = "diagnostics")]
     crate::backreads::touched(src as usize, dst.len(), false);
     // In place first, if asked for (`crate::plaincopy`): the destination is
@@ -9095,6 +9123,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     #[cfg(feature = "diagnostics")]
     crate::backreads::touched(dst as usize, len, true);
+    // Card bytes kept for later there go in first (`crate::lazy`), and
+    // these land over them.
+    crate::lazy::need(dst as usize, dst as usize + len);
     let direct = direct_writes();
     let fast_first = crate::trycopy::on();
     // Only the whole range is tried with the fast copy: in the pieces of
@@ -9358,6 +9389,8 @@ impl Meter {
         crate::plaincopy::line(frames);
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::lazy::line(frames);
         crate::shadow::placed_line();
         if let Some(host) = host() {
             host.drain_messages();

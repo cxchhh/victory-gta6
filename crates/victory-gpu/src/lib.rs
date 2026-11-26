@@ -76,11 +76,14 @@ pub mod queue;
 #[cfg(windows)]
 mod queue2;
 pub mod resource;
+pub mod trace;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+#[cfg(windows)]
+mod lazy;
 #[cfg(windows)]
 mod marks;
 #[cfg(windows)]

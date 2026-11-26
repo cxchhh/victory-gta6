@@ -114,6 +114,17 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Replay a trace of the memory layer (`VICTORY_TRACE=<folder>` in a
+    /// run) without the title: times the refreshes and submissions and,
+    /// with --verify, checks every asked range against title memory.
+    TraceReplay {
+        folder: PathBuf,
+        /// Times the whole trace is replayed (the first warms up).
+        #[arg(long, default_value_t = 3)]
+        passes: u32,
+        #[arg(long)]
+        verify: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -185,6 +196,30 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        Command::TraceReplay { folder, passes, verify } => {
+            let results = victory_gpu::trace::replay(&folder, passes, verify).map_err(anyhow::Error::msg)?;
+            for (i, r) in results.iter().enumerate() {
+                println!(
+                    "pass {}: {:.1} ms for {} submissions ({:.2} ms each; in submit {:.1} ms, asks {:.1} ms, pages {:.1} ms, closing lists {:.1} ms), {} refreshes, copies {:.1} ms {:.1} MB;                      checked {} ranges, {} WRONG, {} unchecked, {} asks without a copy",
+                    i + 1,
+                    r.ms,
+                    r.submissions,
+                    r.ms / r.submissions.max(1) as f64,
+                    r.submit_ms,
+                    r.asks_ms,
+                    r.pages_ms,
+                    r.lists_ms,
+                    r.refreshes,
+                    r.copies_ms,
+                    r.copies_mb,
+                    r.checked,
+                    r.wrong,
+                    r.unchecked,
+                    r.no_copy
+                );
+            }
+            Ok(())
+        }
     }
 }
 

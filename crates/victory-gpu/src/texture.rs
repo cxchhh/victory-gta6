@@ -1092,6 +1092,9 @@ impl Staging {
         } else {
             waited(2, || crate::watch::title_memory_reading_at(start, start + size))
         };
+        // Card bytes kept for later there go in first (`crate::lazy`): the
+        // texture is read in place below.
+        crate::lazy::need(start, start + size);
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the

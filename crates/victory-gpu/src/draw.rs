@@ -4019,6 +4019,8 @@ impl State {
                 // of mapping under the read (see
                 // `crate::watch::title_memory_reading`).
                 let _mapped = crate::watch::title_memory_reading();
+                // Card bytes kept for later there go in first (`crate::lazy`).
+                crate::lazy::need(from, from + n * 3 * stride);
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {

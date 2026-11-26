@@ -147,6 +147,15 @@ fn install() {
         }
         const READ: usize = 0;
         let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
+        // A page whose card bytes are kept for later (`crate::lazy`): they
+        // go in and the copy goes on, as for any other touch of it.
+        if read
+            && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+            && r.NumberParameters >= 2
+            && crate::lazy::fault(r.ExceptionInformation[1], false)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
         if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
             context.Rip = (&raw const victory_copy_guarded_fault) as u64;

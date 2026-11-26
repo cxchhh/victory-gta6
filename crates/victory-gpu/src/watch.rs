@@ -319,8 +319,8 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
 }
 
 /// The asking that last found the 64 KiB page numbered `page` written (0:
-/// never). Read only, for `crate::backreads`.
-#[cfg(feature = "diagnostics")]
+/// never). Read only, for `crate::backreads` and for `crate::lazy`'s
+/// caller (a page written since a copy took it is merged at once).
 pub(crate) fn stamp(page: usize) -> u64 {
     JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.get(&page).copied().unwrap_or(0)
 }
@@ -1587,6 +1587,10 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // What shaders wrote and is kept for later (`crate::lazy`) goes in
+    // first: the kernel's write would fail on its pages, and must land
+    // over the card's bytes, not under them.
+    crate::lazy::need(at, at.saturating_add(len));
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
@@ -1960,6 +1964,9 @@ pub(crate) fn title_memory_reading_at_now(from: usize, to: usize) -> Option<Read
 /// this and [`title_memory_remapped`] are the only ways a block noted
 /// uncommitted is asked about again.
 pub fn title_memory_committed(at: usize, len: usize) {
+    // Kept pieces there (`crate::lazy`) go in, or are dropped if the
+    // memory is new (its protection is no longer ours).
+    crate::lazy::need(at, at.saturating_add(len));
     // The mirror sends these pages again (`crate::flat`).
     crate::flat::remapped(at, len);
     if len == 0 || absent_mode() == 0 {
@@ -1981,6 +1988,8 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // As at a commit ([`title_memory_committed`]).
+    crate::lazy::need(at, at.saturating_add(len));
     // What it shows is new: the mirror sends it again (`crate::flat`).
     crate::flat::remapped(at, len);
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
@@ -2034,8 +2043,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
-/// Takes a write to a guarded block (opens it, the write goes on);
-/// `EXCEPTION_CONTINUE_SEARCH` (0) for anything else. Also asked first by
+/// Takes a write to a guarded block (opens it, the write goes on), and a
+/// read or write of a page whose card bytes `crate::lazy` keeps (merges
+/// them, the access goes on); `EXCEPTION_CONTINUE_SEARCH` (0) for anything
+/// else. Also asked first by
 /// the fast copy's handler (`crate::trycopy`), which may sit ahead of it.
 pub(crate) unsafe extern "system" fn on_write(
     info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
@@ -2047,6 +2058,16 @@ pub(crate) unsafe extern "system" fn on_write(
     // SAFETY: the system passes the exception being dispatched.
     let r = unsafe { &*(*info).ExceptionRecord };
     const WRITE: usize = 1;
+    // A read or a write of a page whose card bytes are kept for later
+    // (`crate::lazy`): they go in, the page is given back, the access goes
+    // on.
+    if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+        && r.NumberParameters >= 2
+        && r.ExceptionInformation[0] <= WRITE
+        && crate::lazy::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE)
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
         || r.NumberParameters < 2
         || r.ExceptionInformation[0] != WRITE
@@ -2071,9 +2092,10 @@ pub(crate) unsafe extern "system" fn on_write(
     }
 }
 
-/// Registers the handler that takes writes to guarded blocks, once, ahead
-/// of the crash reporter's.
-fn install() {
+/// Registers the handler that takes writes to guarded blocks (and every
+/// touch of a page `crate::lazy` keeps), once, ahead of the crash
+/// reporter's.
+pub(crate) fn install() {
     use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
     static ONCE: std::sync::Once = std::sync::Once::new();
     // The switch is read here, not first in the handler ([`open`] asks
