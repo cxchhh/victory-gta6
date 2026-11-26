@@ -2769,6 +2769,18 @@ impl Shadow {
         address.checked_sub(self.start).filter(|&at| at < self.len)
     }
 
+    /// The copy's CPU side of `[address, address + len)` cut to the buffer
+    /// (what goes up to the card; in place, title memory itself), for the
+    /// trace replay's check (`crate::trace`).
+    pub(crate) fn cpu_side(&self, address: u64, len: u64) -> Option<&[u8]> {
+        if self.data.is_null() {
+            return None;
+        }
+        let (from, to) = self.inside(address as usize, len.max(1) as usize);
+        // SAFETY: the copy's own mapping, `len` bytes from `start`.
+        Some(unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) })
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
@@ -2811,6 +2823,7 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
+        crate::trace::refresh(crate::trace::list_id(list), address, len);
         #[cfg(feature = "diagnostics")]
         crate::writewatch::reads(address as usize, len as usize);
         list.defer_refresh(self, address as usize, len as usize);
@@ -2863,6 +2876,7 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        crate::trace::gpu_writes(crate::trace::list_id(list), address, len);
         // The list's prelude takes no record of this copy from here on
         // (`crate::indirect::gather_by_copy`); a copy in place is written
         // by the shaders as any other.
@@ -4113,6 +4127,7 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    crate::trace::registered(resource, start, len);
     let mut map = buffers();
     map.insert(
         (start, resource),
@@ -4129,6 +4144,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
+    crate::trace::unregistered(resource, start);
     let mut map = buffers();
     tables_changed();
     map.remove(&(start, resource));

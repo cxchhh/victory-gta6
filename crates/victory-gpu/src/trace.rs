@@ -1,0 +1,419 @@
+//! A trace of the memory layer, recorded in a run and replayed without the
+//! title (`victory trace-replay <folder>`): the measure and the check of a
+//! change to how title memory reaches the card, in seconds and on the
+//! same input every time, instead of a launch of the title per try.
+//!
+//! What a trace holds (`VICTORY_TRACE=<folder>`, from `VICTORY_TRACE_AFTER`
+//! seconds after the first submission (150), for `VICTORY_TRACE_FOR`
+//! seconds (10)):
+//!
+//! - the title buffers known when it starts and those made and let go
+//!   while it runs ([`crate::shadow::register`]);
+//! - every range a list asks to have brought up to date for its shaders
+//!   ([`crate::shadow::Shadow::refresh`]) and every range its shaders may
+//!   write ([`crate::shadow::Shadow::gpu_writes`]), with the list and the
+//!   recording thread;
+//! - every submission, its lists in order, and, ahead of it, the 64 KiB
+//!   pages of title memory its ranges cover whose bytes changed since the
+//!   trace last held them (the first time: all of them), in `pages.bin`;
+//!   pages of zeros are named, not stored.
+//!
+//! What it leaves out (the replay's limits): the title's draws and
+//! dispatches (nothing is drawn: what shaders write is never written, so
+//! copy-backs find nothing), its other submission-time steps (buffer
+//! copies, fills of upload memory, textures), and view memory's guards
+//! (every page is replayed as write-watched memory).
+//!
+//! The replay maps the traced pages at their own addresses as
+//! write-watched memory, makes the title buffers known, and walks the
+//! events: ranges asked on fresh host lists, pages written before the
+//! submission that read them (the write watch sees the writes, as it saw
+//! the title's), and the submissions sent through [`crate::host::Host`].
+//! After each submission (`--verify`) every range a list asked for is
+//! compared with title memory on the copy's CPU side: the bytes the card
+//! reads must be the title's.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// The unit pages are traced in (the write watch's and the console's).
+const PAGE: u64 = 64 << 10;
+
+/// Kinds of the 40-byte records of `events.bin`: `[kind, a, b, c, d]`.
+const REGISTER: u64 = 1; // resource, start, len
+const UNREGISTER: u64 = 2; // resource, start
+const REFRESH: u64 = 3; // thread, list, address, len
+const GPU_WRITES: u64 = 4; // thread, list, address, len
+const PAGE_BYTES: u64 = 5; // address, offset in pages.bin (u64::MAX: zeros)
+const SUBMIT: u64 = 6; // number, lists that follow, late
+const LIST: u64 = 7; // list
+const END: u64 = 8;
+
+struct Recorder {
+    events: BufWriter<File>,
+    pages: BufWriter<File>,
+    /// Bytes written to `pages.bin`.
+    at: u64,
+    /// The hash of each page as the trace last held it.
+    held: HashMap<u64, [u8; 32]>,
+    started: std::time::Instant,
+    length: std::time::Duration,
+    submissions: u64,
+    page_bytes: u64,
+}
+
+static RECORDER: Mutex<Option<Recorder>> = Mutex::new(None);
+/// Whether a trace is being recorded now (read without the lock).
+static ON: AtomicBool = AtomicBool::new(false);
+/// 0: not asked yet; 1: waiting for the start; 2: recording or done.
+static STATE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether submissions should be shown to [`submitting`]: a trace is
+/// asked for and not finished.
+pub(crate) fn wanted() -> bool {
+    folder().is_some() && (STATE.load(Ordering::Relaxed) == 0 || ON.load(Ordering::Relaxed))
+}
+
+fn folder() -> Option<&'static PathBuf> {
+    static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FOLDER.get_or_init(|| std::env::var_os("VICTORY_TRACE").map(PathBuf::from)).as_ref()
+}
+
+fn seconds(name: &str, usual: f64) -> std::time::Duration {
+    std::time::Duration::from_secs_f64(std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(usual))
+}
+
+fn thread() -> u64 {
+    // SAFETY: no arguments.
+    u64::from(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() })
+}
+
+fn record(r: &mut Recorder, e: [u64; 5]) {
+    let mut bytes = [0u8; 40];
+    for (i, v) in e.iter().enumerate() {
+        bytes[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let _ = r.events.write_all(&bytes);
+}
+
+fn with(f: impl FnOnce(&mut Recorder)) {
+    if !ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut r = RECORDER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = r.as_mut() {
+        f(r);
+    }
+}
+
+/// A host list's name in the trace: its command list, which stays put
+/// while the host list itself moves (a list detached for a late
+/// submission is moved between its recording and its submission).
+pub(crate) fn list_id(list: &crate::host::HostList) -> usize {
+    windows::core::Interface::as_raw(&list.list) as usize
+}
+
+/// A title buffer is known (from [`crate::shadow::register`]).
+pub(crate) fn registered(resource: usize, start: u64, len: u64) {
+    with(|r| record(r, [REGISTER, resource as u64, start, len, 0]));
+}
+
+/// A title buffer is let go.
+pub(crate) fn unregistered(resource: usize, start: u64) {
+    with(|r| record(r, [UNREGISTER, resource as u64, start, 0, 0]));
+}
+
+/// A list asks for a range of title memory for its shaders to read.
+pub(crate) fn refresh(list: usize, address: u64, len: u64) {
+    with(|r| record(r, [REFRESH, thread(), list as u64, address, len]));
+}
+
+/// A list's shaders may write a range of title memory.
+pub(crate) fn gpu_writes(list: usize, address: u64, len: u64) {
+    with(|r| record(r, [GPU_WRITES, thread(), list as u64, address, len]));
+}
+
+/// A submission of `lists`, which bring `ranges` of title memory up to
+/// date: the changed pages of the ranges, then the submission. Starts and
+/// ends the trace by the clock.
+pub(crate) fn submitting(lists: &[usize], ranges: &[(usize, usize)], late: bool) {
+    let Some(folder) = folder() else { return };
+    match STATE.load(Ordering::Relaxed) {
+        0 => {
+            static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let first = *FIRST.get_or_init(std::time::Instant::now);
+            if first.elapsed() >= seconds("VICTORY_TRACE_AFTER", 150.0) {
+                start(folder);
+            }
+            return;
+        }
+        2 if !ON.load(Ordering::Relaxed) => return,
+        _ => {}
+    }
+    let mut guard = RECORDER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(r) = guard.as_mut() else { return };
+    let mut pages: Vec<u64> = ranges
+        .iter()
+        .flat_map(|&(a, n)| (a as u64 / PAGE)..(a as u64 + n as u64).div_ceil(PAGE))
+        .collect();
+    pages.sort_unstable();
+    pages.dedup();
+    let mut buf = vec![0u8; PAGE as usize];
+    for page in pages {
+        let address = page * PAGE;
+        // Through the kernel's read: unmapped pages read as zeros, guards
+        // are not touched.
+        crate::host::copy_mapped(buf.as_mut_ptr(), address as *const u8, PAGE as usize, false);
+        let hash = *blake3::hash(&buf).as_bytes();
+        if r.held.get(&address) == Some(&hash) {
+            continue;
+        }
+        r.held.insert(address, hash);
+        let at = if buf.iter().all(|&b| b == 0) {
+            u64::MAX
+        } else {
+            let _ = r.pages.write_all(&buf);
+            r.at += PAGE;
+            r.page_bytes += PAGE;
+            r.at - PAGE
+        };
+        record(r, [PAGE_BYTES, address, at, 0, 0]);
+    }
+    r.submissions += 1;
+    let n = r.submissions;
+    record(r, [SUBMIT, n, lists.len() as u64, u64::from(late), 0]);
+    for &list in lists {
+        record(r, [LIST, list as u64, 0, 0, 0]);
+    }
+    if r.started.elapsed() >= r.length {
+        record(r, [END, 0, 0, 0, 0]);
+        let _ = r.events.flush();
+        let _ = r.pages.flush();
+        ON.store(false, Ordering::Relaxed);
+        tracing::info!(
+            "trace of the memory layer written to {}: {} submissions, {} MB of pages (VICTORY_TRACE)",
+            folder.display(),
+            r.submissions,
+            r.page_bytes >> 20
+        );
+        *guard = None;
+    }
+}
+
+fn start(folder: &Path) {
+    STATE.store(2, Ordering::Relaxed);
+    if let Err(e) = std::fs::create_dir_all(folder) {
+        tracing::warn!(%e, "no trace: its folder cannot be made");
+        return;
+    }
+    let open = |name: &str| File::create(folder.join(name)).map(|f| BufWriter::with_capacity(8 << 20, f));
+    let (Ok(events), Ok(pages)) = (open("events.bin"), open("pages.bin")) else {
+        tracing::warn!("no trace: its files cannot be made");
+        return;
+    };
+    let mut r = Recorder {
+        events,
+        pages,
+        at: 0,
+        held: HashMap::new(),
+        started: std::time::Instant::now(),
+        length: seconds("VICTORY_TRACE_FOR", 10.0),
+        submissions: 0,
+        page_bytes: 0,
+    };
+    // The buffers known now, as if made at the start.
+    for (i, (start, len, window)) in crate::shadow::spans().into_iter().enumerate() {
+        if !window {
+            record(&mut r, [REGISTER, (1 << 62) | i as u64, start, len, 0]);
+        }
+    }
+    *RECORDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+    ON.store(true, Ordering::Relaxed);
+    tracing::info!("trace of the memory layer started (VICTORY_TRACE={})", folder.display());
+}
+
+/// What a replay measured.
+#[derive(Default, Debug)]
+pub struct Replayed {
+    pub submissions: u64,
+    pub refreshes: u64,
+    pub ms: f64,
+    pub submit_ms: f64,
+    /// Writing the traced pages into title memory (the title's part).
+    pub pages_ms: f64,
+    /// Finding copies and asking for ranges (the recording threads' part).
+    pub asks_ms: f64,
+    pub lists_ms: f64,
+    pub copies_ms: f64,
+    pub copies_mb: f64,
+    pub checked: u64,
+    pub wrong: u64,
+    pub unchecked: u64,
+    pub no_copy: u64,
+}
+
+fn read_events(folder: &Path) -> std::io::Result<Vec<[u64; 5]>> {
+    let mut bytes = Vec::new();
+    File::open(folder.join("events.bin"))?.read_to_end(&mut bytes)?;
+    Ok(bytes
+        .chunks_exact(40)
+        .map(|c| std::array::from_fn(|i| u64::from_le_bytes(c[i * 8..i * 8 + 8].try_into().unwrap())))
+        .collect())
+}
+
+/// Replays the trace in `folder` `passes` times (see the module's
+/// comment); with `verify`, checks every asked range after its submission.
+pub fn replay(folder: &Path, passes: u32, verify: bool) -> Result<Vec<Replayed>, String> {
+    use std::os::windows::fs::FileExt;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    let events = read_events(folder).map_err(|e| format!("events.bin: {e}"))?;
+    let pages = File::open(folder.join("pages.bin")).map_err(|e| format!("pages.bin: {e}"))?;
+    let host = crate::host::host().ok_or("no host device")?;
+    // Title memory: every range the trace names, joined, at its own address.
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    for e in &events {
+        let (a, n) = match e[0] {
+            REGISTER => (e[2], e[3]),
+            REFRESH | GPU_WRITES => (e[3], e[4].max(1)),
+            PAGE_BYTES => (e[1], PAGE),
+            _ => continue,
+        };
+        spans.push((a / PAGE * PAGE, (a + n).div_ceil(PAGE) * PAGE));
+    }
+    spans.sort_unstable();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for (a, b) in spans {
+        match runs.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => runs.push((a, b)),
+        }
+    }
+    let (mut mapped, mut refused) = (0u64, 0u64);
+    for &(a, b) in &runs {
+        // SAFETY: a fixed address the replay owns, or a refusal.
+        let p = unsafe { VirtualAlloc(a as *const _, (b - a) as usize, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+        if p.is_null() {
+            refused += b - a;
+        } else {
+            mapped += b - a;
+        }
+    }
+    tracing::info!(
+        "trace replay: {} events, title memory in {} runs, {} MB mapped, {} MB refused (taken in this process)",
+        events.len(),
+        runs.len(),
+        mapped >> 20,
+        refused >> 20
+    );
+    let mut results = Vec::new();
+    let mut buf = vec![0u8; PAGE as usize];
+    for _ in 0..passes {
+        let mut out = Replayed::default();
+        let started = std::time::Instant::now();
+        let p0 = crate::host::PREPARING[0].load(Ordering::Relaxed);
+        let p1 = crate::host::PREPARING[1].load(Ordering::Relaxed);
+        let mut lists: HashMap<u64, (crate::host::HostList, Vec<(u64, u64)>)> = HashMap::new();
+        let mut i = 0;
+        while i < events.len() {
+            let e = events[i];
+            i += 1;
+            match e[0] {
+                REGISTER => crate::shadow::register(e[1] as usize, e[2], e[3]),
+                UNREGISTER => crate::shadow::unregister(e[1] as usize, e[2]),
+                REFRESH | GPU_WRITES => {
+                    let asked = std::time::Instant::now();
+                    let entry = match lists.entry(e[2]) {
+                        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert((host.new_list().map_err(|e| format!("a host list: {e}"))?, Vec::new()))
+                        }
+                    };
+                    let Some(shadow) = crate::shadow::find(e[3], e[4]) else {
+                        out.no_copy += 1;
+                        continue;
+                    };
+                    if e[0] == REFRESH {
+                        shadow.refresh(&entry.0, e[3], e[4]);
+                        entry.1.push((e[3], e[4]));
+                        out.refreshes += 1;
+                    } else {
+                        shadow.gpu_writes(&entry.0, e[3], e[4]);
+                    }
+                    out.asks_ms += asked.elapsed().as_secs_f64() * 1e3;
+                }
+                PAGE_BYTES => {
+                    let written_at = std::time::Instant::now();
+                    let dst = e[1] as *mut u8;
+                    if e[2] == u64::MAX {
+                        buf.fill(0);
+                    } else {
+                        pages.seek_read(&mut buf, e[2]).map_err(|err| format!("pages.bin at {}: {err}", e[2]))?;
+                    }
+                    // SAFETY: a page the replay mapped above (a refused
+                    // run is skipped by the kernel's write, which fails).
+                    let ok = unsafe {
+                        let mut written = 0usize;
+                        windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory(
+                            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                            dst as *const _,
+                            buf.as_ptr() as *const _,
+                            PAGE as usize,
+                            &mut written,
+                        ) != 0
+                    };
+                    if !ok {
+                        out.unchecked += 1;
+                    }
+                    out.pages_ms += written_at.elapsed().as_secs_f64() * 1e3;
+                }
+                SUBMIT => {
+                    let n = e[2] as usize;
+                    let ids: Vec<u64> = events[i..i + n].iter().map(|l| l[1]).collect();
+                    i += n;
+                    let taken: Vec<(crate::host::HostList, Vec<(u64, u64)>)> =
+                        ids.iter().filter_map(|id| lists.remove(id)).collect();
+                    let closing = std::time::Instant::now();
+                    for (list, _) in &taken {
+                        list.close();
+                    }
+                    out.lists_ms += closing.elapsed().as_secs_f64() * 1e3;
+                    let runs: Vec<&crate::host::HostList> = taken.iter().map(|(l, _)| l).collect();
+                    let sent = std::time::Instant::now();
+                    host.execute(&runs);
+                    out.submit_ms += sent.elapsed().as_secs_f64() * 1e3;
+                    out.submissions += 1;
+                    if verify {
+                        for (_, ranges) in &taken {
+                            for &(a, n) in ranges {
+                                let Some(shadow) = crate::shadow::find(a, n) else { continue };
+                                match shadow.cpu_side(a, n) {
+                                    Some(side) => {
+                                        out.checked += 1;
+                                        // SAFETY: mapped title memory of the replay.
+                                        let title = unsafe { std::slice::from_raw_parts(a as *const u8, side.len()) };
+                                        if title != side {
+                                            out.wrong += 1;
+                                        }
+                                    }
+                                    None => out.unchecked += 1,
+                                }
+                            }
+                        }
+                    }
+                }
+                END => break,
+                _ => {}
+            }
+        }
+        out.ms = started.elapsed().as_secs_f64() * 1e3;
+        out.copies_ms = (crate::host::PREPARING[0].load(Ordering::Relaxed) - p0) as f64 / 1e3;
+        out.copies_mb = (crate::host::PREPARING[1].load(Ordering::Relaxed) - p1) as f64 / f64::from(1 << 20);
+        results.push(out);
+    }
+    Ok(results)
+}

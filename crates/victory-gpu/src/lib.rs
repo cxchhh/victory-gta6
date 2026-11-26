@@ -74,6 +74,7 @@ pub mod queue;
 #[cfg(windows)]
 mod queue2;
 pub mod resource;
+pub mod trace;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
