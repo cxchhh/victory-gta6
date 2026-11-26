@@ -3057,6 +3057,8 @@ impl Shadow {
                     continue;
                 };
                 let at = at + first;
+                #[cfg(feature = "diagnostics")]
+                crate::backreads::before(start + at);
                 crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
                 crate::watch::writing(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
@@ -3066,6 +3068,8 @@ impl Shadow {
                     crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
                     written += len;
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -3975,6 +3979,8 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
+        #[cfg(feature = "diagnostics")]
+        crate::backreads::before(start + at);
         if crate::host::read_into((start + at) as *const u8, title) {
             // The stretch as read: what the card did not change is the
             // title's, and may have been written again since.
@@ -3995,6 +4001,8 @@ impl Shadow {
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
+                #[cfg(feature = "diagnostics")]
+                crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
