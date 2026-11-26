@@ -797,10 +797,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
     {
-        let staging = staging.clone();
-        list.defer_host(move || {
-            staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
+        let held = staging.clone();
+        list.defer_staged(&staging, move || {
+            held.uploaded.store(true, Relaxed);
+            held.dirty.store(false, Relaxed);
         });
     }
     // Levels on demand (`crate::tiles`): after the check below, in the
@@ -816,7 +816,8 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     list.defer_texture(staging.clone());
-    list.defer_host(move || {
+    let key = staging.clone();
+    list.defer_staged(&key, move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
@@ -1077,17 +1078,19 @@ impl Staging {
         // only with this taken alone, so what `committed` finds mapped
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
-        // 74).
+        // 74). With `VICTORY_REMAP_RANGES=1` only changes of mapping that
+        // touch this texture's bytes are waited for
+        // (`crate::watch::remap_ranges`).
         let _mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_at_now(start, start + size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_at(start, start + size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -1652,6 +1655,103 @@ mod title_memory_tests {
                     .detile(in_place, 0, 0, &mut exact, pitch, pitch * height as usize)
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            }
+        }
+    }
+
+    /// What a refresh's parts cost per megabyte, on this machine's memory:
+    /// the hash of the tiled bytes, and the detiling into ordinary (cached)
+    /// memory, into write-combined memory (as the staging buffers in the
+    /// upload heap are), and into cached memory followed by one copy into
+    /// write-combined memory. `cargo test --release -p victory-gpu
+    /// detile_cost -- --ignored --nocapture`.
+    ///
+    /// On the RTX 4070 box (2026-11-27), a 4096x4096 texture of 8-byte
+    /// texels with 13 levels (179 MB tiled), best of 5, ms per MB: the hash
+    /// 0.19; the detiling into cached memory 0.09-0.12, into write-combined
+    /// memory 0.07-0.09, into cached memory and then one copy into
+    /// write-combined memory 0.14-0.17 (4 KiB and 64 KiB standard, 64 KiB
+    /// display swizzles). Write-combined memory takes the detiling's writes
+    /// in whole rows, one after the other, and with no read for ownership
+    /// it is the faster of the two: no cached scratch buffer is put in
+    /// between. A refresh's 103 MB (run keep1's frame 2019) is some 20 ms
+    /// of hashing and 9 of detiling; that frame's 919.5 ms of "textures"
+    /// was not either (`crate::watch::remap_ranges`).
+    #[test]
+    #[ignore]
+    fn detile_cost() {
+        use windows_sys::Win32::System::Memory::*;
+        let size_of = |layout: u32| {
+            let words: [u32; 14] = [3, 0, 0, 0, 4096, 0, 4096, (13 << 16) | 1, 10, 1, 0, layout, 0, 0];
+            // SAFETY: fourteen words are a resource description.
+            let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+            crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
+        };
+        for (name, layout) in [("4KB_S", 0u32), ("64KB_S", 0x100 | 9), ("64KB_D", 0x100 | 10)] {
+            let Some(layout) = size_of(layout) else {
+                println!("{name}: no layout");
+                continue;
+            };
+            let size = layout.size as usize;
+            let tiled: Vec<u8> = (0..size).map(|i| (i * 7 + i / 251) as u8).collect();
+            // The linear subresources as the host lays them out: rows 256
+            // bytes apart at least, each level 512-byte aligned.
+            let mut parts = Vec::new();
+            let mut total = 0usize;
+            for (mip, m) in layout.mips.iter().enumerate() {
+                let pitch = (m.width as usize * 8).next_multiple_of(256);
+                let rows = m.height as usize;
+                parts.push((mip as u32, total, pitch, rows));
+                total = (total + pitch * rows).next_multiple_of(512);
+            }
+            let detile = |into: *mut u8| {
+                for &(mip, at, pitch, rows) in &parts {
+                    // SAFETY: `total` bytes at `into`, this part inside.
+                    let linear = unsafe { std::slice::from_raw_parts_mut(into.add(at), pitch * rows) };
+                    layout.detile(&tiled, mip, 0, linear, pitch, pitch * rows).expect("detiled");
+                }
+            };
+            // SAFETY: allocations of the test's own, written only here.
+            let (cached, combined) = unsafe {
+                let flags = MEM_COMMIT | MEM_RESERVE;
+                (
+                    VirtualAlloc(std::ptr::null(), total, flags, PAGE_READWRITE).cast::<u8>(),
+                    VirtualAlloc(std::ptr::null(), total, flags, PAGE_READWRITE | PAGE_WRITECOMBINE).cast::<u8>(),
+                )
+            };
+            assert!(!cached.is_null() && !combined.is_null());
+            let best = |f: &dyn Fn()| {
+                (0..5)
+                    .map(|_| {
+                        let t = std::time::Instant::now();
+                        f();
+                        t.elapsed().as_secs_f64()
+                    })
+                    .fold(f64::MAX, f64::min)
+            };
+            let mb = size as f64 / 1e6;
+            let hash = best(&|| {
+                std::hint::black_box(blake3::hash(&tiled));
+            });
+            let into_cached = best(&|| detile(cached));
+            let into_combined = best(&|| detile(combined));
+            let through = best(&|| {
+                detile(cached);
+                // SAFETY: both `total` bytes.
+                unsafe { std::ptr::copy_nonoverlapping(cached, combined, total) };
+            });
+            println!(
+                "{name}: {mb:.0} MB tiled; ms per MB: hash {:.3}, detile into cached {:.3}, into write-combined {:.3}, \
+                 into cached then one copy into write-combined {:.3}",
+                hash * 1e3 / mb,
+                into_cached * 1e3 / mb,
+                into_combined * 1e3 / mb,
+                through * 1e3 / mb
+            );
+            // SAFETY: the allocations above.
+            unsafe {
+                VirtualFree(cached.cast(), 0, MEM_RELEASE);
+                VirtualFree(combined.cast(), 0, MEM_RELEASE);
             }
         }
     }

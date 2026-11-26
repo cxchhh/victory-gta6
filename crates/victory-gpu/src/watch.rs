@@ -1715,14 +1715,168 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// does.
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+/// Whether a change of mapping keeps only the reads of texture memory it
+/// touches waiting, not all of them (`VICTORY_REMAP_RANGES=1`; off by
+/// default: every read in place waits for every change, as before).
+///
+/// While the world streams in, the runtime changes mappings hundreds of
+/// times a frame and holds [`MAPPING`] alone for most of the frame: in the
+/// hitch frame 2019 of run keep1 (1,138 ms) "remapping: 331 calls 931.5
+/// ms", and the frame line's "textures 919.5 ms 103.1 MB" was 875.5 ms of
+/// "waiting for title memory to hold still" (6.0 ms asking the write
+/// watch; 38 ms reading, hashing and detiling). The frames around it were
+/// alike (2018: 720 calls 390 ms, refreshes 412 ms of which 364 waiting;
+/// 2027: 177 calls 454 ms, 489 of which 437 waiting). A texture's refresh
+/// only needs its own pages to stay mapped, and a change of mapping takes
+/// away and puts back only the views it touches (xmem `unmap` and `map`:
+/// the views that overlap the range asked for, and the range itself; the
+/// placeholders split around them are not readable memory either way).
+///
+/// With the switch the runtime says which addresses a change touches
+/// ([`title_memory_remapping_at`]), and the reads of texture memory in
+/// place ([`title_memory_reading_at`], `crate::texture`) wait only for the
+/// changes that touch their bytes; a change waits only for the reads of
+/// those bytes. A change asked for keeps new reads of its bytes out until
+/// it is done (as the lock did: the runtime is not starved). Every other
+/// read in place still takes [`MAPPING`], which a change takes too, so for
+/// those nothing changes.
+pub(crate) fn remap_ranges() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_REMAP_RANGES").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "texture reads in place wait only for the changes of mapping that touch their bytes (VICTORY_REMAP_RANGES=1)"
+            );
+        }
+        on
+    })
+}
+
+/// Address ranges being read in place and being remapped, for
+/// [`remap_ranges`]: a read waits for a change that overlaps it (under way
+/// or asked for), a change for the reads that overlap it.
+pub(crate) struct RangeLock {
+    state: Mutex<RangeState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct RangeState {
+    /// Changes under way, and changes asked for that wait for reads.
+    remapping: Vec<(usize, usize)>,
+    asked: Vec<(usize, usize)>,
+    /// Reads under way (a range may be there more than once).
+    reading: Vec<(usize, usize)>,
+}
+
+/// Whether `[a, b)` and `[c, d)` share a byte.
+fn overlap((a, b): (usize, usize), (c, d): (usize, usize)) -> bool {
+    a < d && c < b
+}
+
+/// Takes one copy of `range` out of `list`.
+fn take_out(list: &mut Vec<(usize, usize)>, range: (usize, usize)) {
+    if let Some(at) = list.iter().position(|&r| r == range) {
+        list.swap_remove(at);
+    }
+}
+
+impl RangeLock {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: Mutex::new(RangeState {
+                remapping: Vec::new(),
+                asked: Vec::new(),
+                reading: Vec::new(),
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RangeState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether a read of `range` must wait: a change of it is under way or
+    /// asked for.
+    fn read_blocked(state: &RangeState, range: (usize, usize)) -> bool {
+        state.remapping.iter().chain(&state.asked).any(|&r| overlap(r, range))
+    }
+
+    /// Reads `[from, to)` in place once no change touches it.
+    pub(crate) fn read(&self, from: usize, to: usize) -> RangeRead<'_> {
+        let range = (from, to);
+        let mut state = self.lock();
+        while Self::read_blocked(&state, range) {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state.reading.push(range);
+        RangeRead(self, range)
+    }
+
+    /// [`RangeLock::read`] if no change touches the range now.
+    pub(crate) fn try_read(&self, from: usize, to: usize) -> Option<RangeRead<'_>> {
+        let range = (from, to);
+        let mut state = self.lock();
+        if Self::read_blocked(&state, range) {
+            return None;
+        }
+        state.reading.push(range);
+        Some(RangeRead(self, range))
+    }
+
+    /// Changes the mapping of `[from, to)` once no read of it is under
+    /// way; new reads of it wait from now on.
+    pub(crate) fn remap(&self, from: usize, to: usize) -> RangeRemap<'_> {
+        let range = (from, to);
+        let mut state = self.lock();
+        state.asked.push(range);
+        while state.reading.iter().any(|&r| overlap(r, range)) {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        take_out(&mut state.asked, range);
+        state.remapping.push(range);
+        RangeRemap(self, range)
+    }
+}
+
+/// A read in place of a range ([`RangeLock::read`]), until dropped.
+pub(crate) struct RangeRead<'a>(&'a RangeLock, (usize, usize));
+
+impl Drop for RangeRead<'_> {
+    fn drop(&mut self) {
+        take_out(&mut self.0.lock().reading, self.1);
+        self.0.changed.notify_all();
+    }
+}
+
+/// A change of mapping of a range ([`RangeLock::remap`]), until dropped.
+pub(crate) struct RangeRemap<'a>(&'a RangeLock, (usize, usize));
+
+impl Drop for RangeRemap<'_> {
+    fn drop(&mut self) {
+        take_out(&mut self.0.lock().remapping, self.1);
+        self.0.changed.notify_all();
+    }
+}
+
+/// The ranges of [`remap_ranges`].
+static RANGES: RangeLock = RangeLock::new();
+
 /// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
+/// ([`title_memory_remapping`]): with [`remap_ranges`], first the range it
+/// touches, then [`MAPPING`] (let go in that order).
+pub struct Remapping(
+    #[allow(dead_code)] Option<RangeRemap<'static>>,
+    #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
+    std::time::Instant,
+);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
         // From asking for the lock until it is let go (the frame log).
-        crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
+        crate::framelog::add(crate::framelog::T::RemapUs, self.2.elapsed().as_micros() as u64);
     }
 }
 
@@ -1731,22 +1885,39 @@ impl Drop for Remapping {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_at(|| (0, usize::MAX))
+}
+
+/// [`title_memory_remapping`] for a change that touches only the addresses
+/// `touched` returns (asked only with [`remap_ranges`]): every view it takes
+/// away or maps, whole. Reads in place of other texture memory
+/// ([`title_memory_reading_at`]) go on meanwhile.
+pub fn title_memory_remapping_at(touched: impl FnOnce() -> (usize, usize)) -> Remapping {
     let asked = std::time::Instant::now();
+    let range = remap_ranges().then(|| {
+        let (from, to) = touched();
+        RANGES.remap(from, to)
+    });
     let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     crate::framelog::add(crate::framelog::T::Remaps, 1);
     crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
-    Remapping(held, asked)
+    Remapping(range, held, asked)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] Held);
+
+enum Held {
+    Whole(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
+    Range(#[allow(dead_code)] RangeRead<'static>),
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    Reading(Held::Whole(MAPPING.read().unwrap_or_else(|e| e.into_inner())))
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
@@ -1754,9 +1925,31 @@ pub fn title_memory_reading() -> Reading {
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+        Ok(guard) => Some(Reading(Held::Whole(guard))),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(Held::Whole(e.into_inner()))),
         Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// [`title_memory_reading`] for a read of `[from, to)` alone: with
+/// [`remap_ranges`] it waits only for changes of mapping that touch those
+/// bytes; without, it is [`title_memory_reading`]. The same rules: not
+/// taken twice by one thread, nor held across anything that maps title
+/// memory.
+pub(crate) fn title_memory_reading_at(from: usize, to: usize) -> Reading {
+    if remap_ranges() {
+        Reading(Held::Range(RANGES.read(from, to)))
+    } else {
+        title_memory_reading()
+    }
+}
+
+/// [`title_memory_reading_at`] if it can be had at once.
+pub(crate) fn title_memory_reading_at_now(from: usize, to: usize) -> Option<Reading> {
+    if remap_ranges() {
+        RANGES.try_read(from, to).map(|r| Reading(Held::Range(r)))
+    } else {
+        title_memory_reading_now()
     }
 }
 
@@ -2861,6 +3054,65 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// `VICTORY_REMAP_RANGES`: a change of mapping waits for the reads in
+    /// place of the bytes it touches and for no other, a read waits for the
+    /// changes that touch its bytes and for no other, and a change asked
+    /// for keeps new reads of its bytes out while it waits (the runtime is
+    /// not starved by a stream of reads).
+    #[test]
+    fn ranged_reads_and_remappings_wait_only_for_what_they_share() {
+        use super::RangeLock;
+        static LOCK: RangeLock = RangeLock::new();
+        // A read of [0x1000, 0x2000) under way; a change of [0x3000,
+        // 0x4000) goes ahead at once, one of [0x1800, 0x3000) waits.
+        let reading = LOCK.read(0x1000, 0x2000);
+        drop(LOCK.remap(0x3000, 0x4000));
+        let changed = Arc::new(AtomicBool::new(false));
+        let (began, wait) = mpsc::channel();
+        let change = {
+            let changed = changed.clone();
+            std::thread::spawn(move || {
+                began.send(()).unwrap();
+                let _changing = LOCK.remap(0x1800, 0x3000);
+                changed.store(true, Ordering::SeqCst);
+            })
+        };
+        wait.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!changed.load(Ordering::SeqCst), "the mapping changed under a read in place of its bytes");
+        // The change is asked for: a new read of its bytes waits, a read of
+        // others does not.
+        assert!(LOCK.try_read(0x2800, 0x2900).is_none(), "a read began on bytes a change waits for");
+        assert!(LOCK.try_read(0x5000, 0x6000).is_some());
+        drop(reading);
+        change.join().unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        // A change under way: a read of its bytes waits until it is done,
+        // a read of others does not.
+        let changing = LOCK.remap(0x1_0000, 0x2_0000);
+        assert!(LOCK.try_read(0x1_f000, 0x2_1000).is_none());
+        assert!(LOCK.try_read(0x2_0000, 0x2_1000).is_some(), "ranges are half open");
+        let read = Arc::new(AtomicBool::new(false));
+        let (began, wait) = mpsc::channel();
+        let reader = {
+            let read = read.clone();
+            std::thread::spawn(move || {
+                began.send(()).unwrap();
+                let _reading = LOCK.read(0x1_8000, 0x1_9000);
+                read.store(true, Ordering::SeqCst);
+            })
+        };
+        wait.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!read.load(Ordering::SeqCst), "a read in place began during a change of its bytes");
+        drop(changing);
+        reader.join().unwrap();
+        assert!(read.load(Ordering::SeqCst));
+        // Nothing is left behind: both kinds go ahead at once.
+        drop(LOCK.read(0, usize::MAX));
+        drop(LOCK.remap(0, usize::MAX));
     }
 
     /// What one write-watch asking (with reset) costs against the size of
