@@ -31,6 +31,10 @@ pub(crate) struct HostHeap {
     /// and 0 before a slot is made null, so a reader that finds its key
     /// here finds the slot made.
     made_now: Box<[std::sync::atomic::AtomicU64]>,
+    /// The count of pages that left the mirror of title memory
+    /// (`crate::flat::evictions`) when this heap's slots that show the
+    /// mirror were last made due ([`HostHeap::flat_slots_due`]).
+    flat_seen: std::sync::atomic::AtomicU64,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -1137,6 +1141,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             made_now: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            flat_seen: std::sync::atomic::AtomicU64::new(0),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1479,7 +1484,7 @@ impl HostHeap {
             return;
         }
         let rows = match view {
-            &View::Constant(address, size) => crate::shadow::find(address, u64::from(size))
+            &View::Constant(address, size) => crate::shadow::find_read(address, u64::from(size))
                 .map_or(0, |shadow| (shadow.gpu(address) % 256 / 16) as u32),
             _ => 0,
         };
@@ -1907,6 +1912,40 @@ impl HostHeap {
 
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
+    /// Pages left the mirror of title memory (`crate::flat`, `evictions`
+    /// the count now): every slot that shows a window of it is made again
+    /// when a draw or a pass next reads it ([`HostHeap::mirror`] finds its
+    /// view not made, and the buffer pass finds it changed). Until then it
+    /// shows the mirror, which goes on taking the title's bytes.
+    fn flat_slots_due(&self, evictions: u64) {
+        use std::sync::atomic::Ordering;
+        let mut made = locked(&self.made, 4);
+        if self.flat_seen.swap(evictions, Ordering::AcqRel) == evictions {
+            return;
+        }
+        let windows = crate::flat::window_raws();
+        let showing: Vec<u32> = {
+            use windows::core::Interface;
+            let kept = locked(&self.kept, 11);
+            kept.iter()
+                .enumerate()
+                .take(self.count as usize)
+                .filter(|(_, r)| r.as_ref().is_some_and(|r| windows.contains(&(r.as_raw() as usize))))
+                .map(|(i, _)| i as u32)
+                .collect()
+        };
+        if showing.is_empty() {
+            return;
+        }
+        let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
+        for &index in &showing {
+            made[index as usize] = 0;
+            self.made_now[index as usize].store(0, Ordering::Release);
+            changed.insert(index);
+        }
+        tracing::debug!(slots = showing.len(), "slots that show the mirror of title memory are made again (pages left it)");
+    }
+
     fn unmake(&self, made: &mut [u64], index: u32) {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
@@ -2325,7 +2364,7 @@ impl HostHeap {
         if index >= self.count + self.dynamic {
             return false;
         }
-        let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+        let Some(shadow) = crate::shadow::find_read(address, u64::from(size)) else {
             return false;
         };
         let Some(host) = host() else { return false };
@@ -2501,6 +2540,13 @@ impl HostHeap {
                 );
             }
             return None;
+        }
+        // Pages left the mirror of title memory (shaders write them now):
+        // the slots that show the mirror are made again by the draws and
+        // passes that read them next.
+        let evictions = crate::flat::evictions();
+        if self.flat_seen.load(std::sync::atomic::Ordering::Acquire) != evictions {
+            self.flat_slots_due(evictions);
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -2764,13 +2810,19 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if len == 0 {
         return None;
     }
+    // As [`make`] finds it: a view shaders read in the mirror of title
+    // memory if it takes it (`crate::flat`), unordered access in a copy.
+    let writes = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+    let find = |address: u64, len: u64| {
+        if writes { crate::shadow::find(address, len) } else { crate::shadow::find_read(address, len) }
+    };
     // A view off its buffer's elements is made on a copy of its own bytes
     // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
     // of the copy they find, so that the copy brought up to date is the
     // one the slot shows.
     if let Some((base, width)) = buffer_extent(view)
         && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
-        && let Some(whole) = crate::shadow::find(base, width)
+        && let Some(whole) = find(base, width)
         && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
         && let Some(own) = crate::shadow::exact(start, bytes)
     {
@@ -2781,11 +2833,11 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
         // (The console is lax: a view may begin past its buffer's end.)
         && address >= base
         && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::find(base, width)
+        && let Some(shadow) = find(base, width)
     {
         return Some((shadow, address, len));
     }
-    crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
+    find(address, len).map(|shadow| (shadow, address, len))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -3013,7 +3065,7 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = crate::shadow::find_read(address, len)?;
     let offset = shadow.offset(address);
     // Off the elements of that copy: on a copy of its own bytes, from its
     // element 0 (`own_bytes`).
@@ -3101,6 +3153,8 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    // Shaders may write it: its pages are the copies' (`crate::flat`).
+    crate::flat::gpu_wrote(address, len);
     let shadow = crate::shadow::find(address, len)?;
     // Off the elements of that copy: on a copy of its own bytes, from its
     // element 0 (`own_bytes`).
@@ -3346,7 +3400,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let shadow = crate::shadow::find_read(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             // The host wants 256-byte alignment, the console 16: the view
             // begins at the boundary at or below, and shaders add the rows

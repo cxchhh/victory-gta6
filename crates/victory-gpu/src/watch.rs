@@ -1960,6 +1960,8 @@ pub(crate) fn title_memory_reading_at_now(from: usize, to: usize) -> Option<Read
 /// this and [`title_memory_remapped`] are the only ways a block noted
 /// uncommitted is asked about again.
 pub fn title_memory_committed(at: usize, len: usize) {
+    // The mirror sends these pages again (`crate::flat`).
+    crate::flat::remapped(at, len);
     if len == 0 || absent_mode() == 0 {
         return;
     }
@@ -1979,6 +1981,8 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // What it shows is new: the mirror sends it again (`crate::flat`).
+    crate::flat::remapped(at, len);
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
     crate::backreads::remapped(at, len);

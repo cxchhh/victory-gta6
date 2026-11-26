@@ -59,7 +59,7 @@ pub(crate) struct Host {
     presenter: Mutex<Option<Presenter>>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
-    adapter: Option<IDXGIAdapter3>,
+    pub(crate) adapter: Option<IDXGIAdapter3>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -3261,6 +3261,16 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
+                // The mirror (`crate::flat`) is sent from title memory: what
+                // flights' shaders write into copies must be there first.
+                // (The pages they write leave the mirror; a slot made on
+                // the mirror before that still reads it until made again.)
+                Step::Refresh(shadow, address, len) if shadow.is_flat() && touches(written, *address, *address + *len) => {
+                    if count {
+                        LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Some(WHY_READ);
+                }
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::Staged(..) => {}
             }
         }
@@ -6440,6 +6450,7 @@ impl Host {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
+                        && !shadow.is_flat()
                     {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -6478,6 +6489,11 @@ impl Host {
         batch.flush_textures();
         batch.flush();
         crate::watch::ask_once_end();
+        // The mirror of title memory (`crate::flat`): its new tiles and the
+        // pages its windows' refreshes named that the title wrote, ahead of
+        // the lists on the queue. The next value of the fence is signalled
+        // behind them.
+        crate::flat::submit(&self.queue, &self.fence, *submitted + 1, std::mem::take(&mut batch.flat));
         part = prep_part(2, part);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -8273,6 +8289,12 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
+                    // A window of the mirror (`crate::flat`): its pages are
+                    // sent once for the whole submission, after its steps.
+                    if shadow.is_flat() {
+                        batch.flat.push((*address, *len));
+                        continue;
+                    }
                     batch.add(shadow, *address, *len);
                     continue;
                 }
@@ -8532,6 +8554,9 @@ struct Batch {
     later: Vec<std::sync::Arc<crate::texture::Staging>>,
     later_keys: std::collections::HashSet<usize>,
     after: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// The ranges (title address, bytes) refreshes named in windows of the
+    /// mirror (`crate::flat`): sent together once the steps have run.
+    flat: Vec<(usize, usize)>,
 }
 
 impl Batch {

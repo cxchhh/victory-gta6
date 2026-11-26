@@ -64,9 +64,9 @@ use crate::host::host;
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
 
-/// Tiles in one heap of the pool (64 MiB). The largest level given is a
+/// Tiles in one heap of a pool (64 MiB). The largest level given is a
 /// 4096x4096 one of one byte a texel: 256 tiles.
-const HEAP_TILES: u32 = 1024;
+pub(crate) const HEAP_TILES: u32 = 1024;
 
 /// Since the start, or now: such textures alive; the bytes all their
 /// levels would take; the bytes of the tiles given to them; the bytes of
@@ -139,7 +139,7 @@ struct Heap {
 }
 
 // SAFETY: a heap of the device, named only in queue and device calls, which
-// any thread may make; its free runs are plain numbers behind `POOL`'s lock.
+// any thread may make; its free runs are plain numbers behind its pool's lock.
 unsafe impl Send for Heap {}
 
 impl Heap {
@@ -148,98 +148,143 @@ impl Heap {
     }
 }
 
-/// The pool's heaps by place; a place is empty after its heap went back to
-/// the card (a texture names its heaps by place).
-static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
-
-/// `count` tiles of one heap, in as many runs as it takes, the lowest free
-/// tiles first (single free tiles are used up before a long run is cut):
-/// the heap, its place in the pool and the runs (first tile, tiles). A new
-/// heap is made when no heap has that many free.
-fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
-    if count == 0 || count > HEAP_TILES {
-        return None;
-    }
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
-    let index = match found {
-        Some(index) => index,
-        None => {
-            let desc = D3D12_HEAP_DESC {
-                SizeInBytes: u64::from(HEAP_TILES) * TILE,
-                Properties: D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_DEFAULT,
-                    ..Default::default()
-                },
-                Alignment: 0,
-                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
-            };
-            let mut made: Option<ID3D12Heap> = None;
-            // SAFETY: plain creation; the out pointer is ours.
-            if let Err(e) = unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) } {
-                tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
-                return None;
-            }
-            let fresh = Heap {
-                heap: made?,
-                free: vec![(0, HEAP_TILES)],
-            };
-            STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
-            match pool.iter().position(Option::is_none) {
-                Some(index) => {
-                    pool[index] = Some(fresh);
-                    index
-                }
-                None => {
-                    pool.push(Some(fresh));
-                    pool.len() - 1
-                }
-            }
-        }
-    };
-    let h = pool[index].as_mut()?;
-    let mut runs = Vec::new();
-    let mut left = count;
-    while left > 0 {
-        let &(start, tiles) = h.free.first()?;
-        let part = tiles.min(left);
-        runs.push((start, part));
-        if part == tiles {
-            h.free.remove(0);
-        } else {
-            h.free[0] = (start + part, tiles - part);
-        }
-        left -= part;
-    }
-    Some((h.heap.clone(), index, runs))
+/// Heaps of 64 KiB tiles, by place; a place is empty after its heap went
+/// back to the card (a holder of tiles names its heaps by place). One for
+/// the levels of textures ([`POOL`]), one per mirror of title memory
+/// (`crate::flat`, buffers' tiles: a heap of tier 1 holds buffers or
+/// textures, not both).
+pub(crate) struct Pool {
+    heaps: Mutex<Vec<Option<Heap>>>,
+    flags: D3D12_HEAP_FLAGS,
+    /// The textures' pool: its heaps are counted in [`STATS`].
+    textures: bool,
+    /// The bytes of the pool's heaps now.
+    pub(crate) heap_bytes: AtomicU64,
 }
 
-/// Gives the runs `runs` of the pool's heap at `index` back; runs that
-/// touch become one. A heap with every tile free goes back to the card,
-/// unless it is the pool's only one. (Called when the texture that held
-/// the tiles is dropped: nothing on the card reads through its mappings
-/// any more, as for any host texture that is dropped.)
-fn give_back(index: usize, runs: &[(u32, u32)]) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(Some(h)) = pool.get_mut(index) else {
-        return;
-    };
-    h.free.extend_from_slice(runs);
-    h.free.sort_unstable();
-    let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
-    for &(from, tiles) in &h.free {
-        match joined.last_mut() {
-            Some(last) if last.0 + last.1 == from => last.1 += tiles,
-            _ => joined.push((from, tiles)),
+/// The pool of the levels of textures.
+static POOL: Pool = Pool::new(D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES, true);
+
+impl Pool {
+    pub(crate) const fn new(flags: D3D12_HEAP_FLAGS, textures: bool) -> Pool {
+        Pool {
+            heaps: Mutex::new(Vec::new()),
+            flags,
+            textures,
+            heap_bytes: AtomicU64::new(0),
         }
     }
-    h.free = joined;
-    let all_free = h.free_tiles() == HEAP_TILES;
-    if all_free && pool.iter().flatten().count() > 1 {
-        pool[index] = None;
-        STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
-        STATS[8].fetch_add(1, Ordering::Relaxed);
+
+    /// A pool of tiles for buffers.
+    pub(crate) const fn for_buffers() -> Pool {
+        Pool::new(D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, false)
     }
+
+    /// `count` tiles of one heap, in as many runs as it takes, the lowest
+    /// free tiles first (single free tiles are used up before a long run
+    /// is cut): the heap, its place in the pool and the runs (first tile,
+    /// tiles). A new heap is made when no heap has that many free.
+    pub(crate) fn take(&self, device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
+        if count == 0 || count > HEAP_TILES {
+            return None;
+        }
+        let mut pool = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
+        let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
+        let index = match found {
+            Some(index) => index,
+            None => {
+                let desc = D3D12_HEAP_DESC {
+                    SizeInBytes: u64::from(HEAP_TILES) * TILE,
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    Alignment: 0,
+                    Flags: self.flags,
+                };
+                let mut made: Option<ID3D12Heap> = None;
+                // SAFETY: plain creation; the out pointer is ours.
+                if let Err(e) = unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) } {
+                    tracing::warn!(error = %e, textures = self.textures, "no heap for tiles given on demand");
+                    return None;
+                }
+                let fresh = Heap {
+                    heap: made?,
+                    free: vec![(0, HEAP_TILES)],
+                };
+                if self.textures {
+                    STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+                }
+                self.heap_bytes.fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+                match pool.iter().position(Option::is_none) {
+                    Some(index) => {
+                        pool[index] = Some(fresh);
+                        index
+                    }
+                    None => {
+                        pool.push(Some(fresh));
+                        pool.len() - 1
+                    }
+                }
+            }
+        };
+        let h = pool[index].as_mut()?;
+        let mut runs = Vec::new();
+        let mut left = count;
+        while left > 0 {
+            let &(start, tiles) = h.free.first()?;
+            let part = tiles.min(left);
+            runs.push((start, part));
+            if part == tiles {
+                h.free.remove(0);
+            } else {
+                h.free[0] = (start + part, tiles - part);
+            }
+            left -= part;
+        }
+        Some((h.heap.clone(), index, runs))
+    }
+
+    /// Gives the runs `runs` of the pool's heap at `index` back; runs that
+    /// touch become one. A heap with every tile free goes back to the
+    /// card, unless it is the pool's only one. (Called when what held the
+    /// tiles is dropped: nothing on the card reads through its mappings
+    /// any more.)
+    pub(crate) fn give_back(&self, index: usize, runs: &[(u32, u32)]) {
+        let mut pool = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(Some(h)) = pool.get_mut(index) else {
+            return;
+        };
+        h.free.extend_from_slice(runs);
+        h.free.sort_unstable();
+        let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
+        for &(from, tiles) in &h.free {
+            match joined.last_mut() {
+                Some(last) if last.0 + last.1 == from => last.1 += tiles,
+                _ => joined.push((from, tiles)),
+            }
+        }
+        h.free = joined;
+        let all_free = h.free_tiles() == HEAP_TILES;
+        if all_free && pool.iter().flatten().count() > 1 {
+            pool[index] = None;
+            if self.textures {
+                STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+                STATS[8].fetch_add(1, Ordering::Relaxed);
+            }
+            self.heap_bytes.fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+        }
+    }
+}
+
+/// [`Pool::take`] of the textures' pool.
+fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
+    POOL.take(device, count)
+}
+
+/// [`Pool::give_back`] of the textures' pool.
+fn give_back(index: usize, runs: &[(u32, u32)]) {
+    POOL.give_back(index, runs);
 }
 
 /// What is given so far to one texture.

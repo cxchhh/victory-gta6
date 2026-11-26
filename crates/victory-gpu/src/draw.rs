@@ -1052,7 +1052,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = crate::shadow::find_read(address, 1)?;
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
@@ -1383,7 +1383,7 @@ impl State {
             // (`root_uav`, `root_srv_table`).
             // shortcut: found again here, not taken from the list's slot.
             return match self.roots_ref(compute).get(usize::from(slot)) {
-                Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(0, |s| {
+                Some(&Root::View(address)) => crate::shadow::find_read(address, 1).map_or(0, |s| {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                     ((s.gpu(address) - base) & 15) as u32
@@ -1478,7 +1478,7 @@ impl State {
             if v.address == 0 || v.size == 0 {
                 continue;
             }
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) = crate::shadow::find_any_read(v.address, u64::from(v.size)) else {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -1496,7 +1496,7 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) = crate::shadow::find_any_read(v.address, u64::from(v.size)) else {
                 return not_bound("an index buffer outside title buffers", "");
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -1873,6 +1873,9 @@ impl State {
         });
         let find = |a: u64| {
             let s = crate::shadow::find(a, 1)?;
+            // Shaders may write it: its pages are the copies'
+            // (`crate::flat`).
+            crate::flat::gpu_wrote(a, s.left(a));
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
@@ -1991,7 +1994,7 @@ impl State {
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
-                let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                let shadow = address.and_then(|a| crate::shadow::find_read(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
                     return not_bound("a root SRV's one-view table", slot_refusal());
                 };

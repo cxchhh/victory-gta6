@@ -80,6 +80,11 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With `crate::flat`: not a copy of one buffer but a window of the
+    /// mirror of title memory, 4 GiB of title addresses at `start` in a
+    /// reserved buffer. Brought up to date by the mirror's pass at
+    /// submission, never by [`Shadow::update`]; shaders only read it.
+    flat: bool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2447,6 +2452,10 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if self.flat {
+            // Never counted with the copies (`Shadow::flat_window`).
+            return;
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2769,9 +2778,21 @@ impl Shadow {
         address.checked_sub(self.start).filter(|&at| at < self.len)
     }
 
-    /// Bytes from a title address to the buffer's end.
+    /// Bytes from a title address to the buffer's end. In a window of the
+    /// mirror (`crate::flat`): to the end of the title buffer that holds
+    /// the address, as its copy would say (memory outside buffers: to the
+    /// end of its 4 MiB cell, as a window outside buffers would).
     pub(crate) fn left(&self, address: u64) -> u64 {
+        if self.flat {
+            return crate::flat::left(address).min((self.start + self.len).saturating_sub(address));
+        }
         (self.start + self.len).saturating_sub(address)
+    }
+
+    /// Whether this is a window of the mirror of title memory
+    /// (`crate::flat`), not a copy.
+    pub(crate) fn is_flat(&self) -> bool {
+        self.flat
     }
 
     /// Whether the memory behind the copy turned out not to be write-watched:
@@ -2804,6 +2825,26 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        shadow
+    }
+
+    /// A window of the mirror of title memory (`crate::flat`): `buffer` is
+    /// a reserved buffer of `len` bytes whose offsets are title addresses
+    /// from `start` on. Shaped as a copy so that everything that binds or
+    /// views a copy works on it unchanged; it is brought up to date by the
+    /// mirror (`Step::Refresh` hands it its ranges) and never copied back.
+    pub(crate) fn flat_window(buffer: ID3D12Resource, start: u64, len: u64) -> Shadow {
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mirrored"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), gpu, start, 0);
+        // Not a copy: not counted with them.
+        LIVE[0].fetch_sub(1, Ordering::Relaxed);
+        shadow.len = len;
+        // Watched: the heap pass copies unwatched copies whole; the
+        // mirror asks the write watch page by page itself.
+        *shadow.watched.get_mut() = 1;
+        shadow.flat = true;
         shadow
     }
 
@@ -2844,6 +2885,7 @@ impl Shadow {
             window: false,
             uploaded: 0,
             place: None,
+            flat: false,
         }
     }
 
@@ -2877,6 +2919,15 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        // The mirror (`crate::flat`) leaves these pages to the copies from
+        // now on: readers and writers then share one host copy. Shaders
+        // given the mirror itself to write would write it unseen: that is
+        // counted, and the pages leave it too.
+        crate::flat::gpu_wrote(address, len);
+        if self.flat {
+            crate::flat::written_through(address, len);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         crate::writewatch::writes(address as usize, len as usize);
         crate::flat::census_gpu_writes(address, len);
@@ -2892,7 +2943,7 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        if self.place.is_some() {
+        if self.place.is_some() || self.flat {
             return;
         }
         let range = (address, address + len);
@@ -3569,8 +3620,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        // In place: the card reads title memory itself.
-        if self.place.is_some() {
+        // In place: the card reads title memory itself. A window of the
+        // mirror is brought up to date by the mirror (`crate::flat`).
+        if self.place.is_some() || self.flat {
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -4125,6 +4177,9 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    // The mirror's notes of the pages the buffer lies on (`crate::flat`),
+    // with the table's lock held, as they are taken.
+    crate::flat::buffers_changed(start, len);
     // After the insert, with the table's lock still held ([`TABLES_CHANGED`];
     // fork pull request #1245: said before it, a thread that asked between
     // the two kept the old table's answer under the new count for good).
@@ -4135,7 +4190,67 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 pub(crate) fn unregister(resource: usize, start: u64) {
     let mut map = buffers();
     tables_changed();
-    map.remove(&(start, resource));
+    if let Some(entry) = map.remove(&(start, resource)) {
+        crate::flat::buffers_changed(start, entry.end - start);
+    }
+}
+
+/// For the mirror of title memory (`crate::flat`), of the page
+/// `[from, to)`: whether every title buffer on it starts on 256 bytes (then
+/// a title address is at the same place modulo 256 in the mirror and in
+/// any copy [`lookup`] would find: constant buffers' rows and raw views'
+/// bias agree whichever was asked), and, if no buffer starts or ends inside
+/// the page, the end of the buffer [`lookup`] would find for an address on
+/// it (`Some(0)`: none, memory outside buffers). `note` is called with the
+/// answer while the table's lock is held, so that [`register`] cannot come
+/// between the answer and the note.
+pub(crate) fn page_layout(from: u64, to: u64, note: impl FnOnce(bool, Option<u64>)) -> (bool, Option<u64>) {
+    let map = buffers();
+    let mut aligned = true;
+    let mut even = true;
+    for (key, entry) in map.range(..(to, 0)).rev().take(256) {
+        if entry.end <= from {
+            continue;
+        }
+        aligned &= key.0 % 256 == 0;
+        even &= !(key.0 > from && key.0 < to) && !(entry.end > from && entry.end < to);
+    }
+    let end = even.then(|| inner_end(&map, from).unwrap_or(0));
+    note(aligned, end);
+    (aligned, end)
+}
+
+/// The end of the title buffer [`lookup`] finds for `address` asked without
+/// a length (`None`: outside buffers).
+pub(crate) fn buffer_end(address: u64) -> Option<u64> {
+    inner_end(&buffers(), address)
+}
+
+fn inner_end(map: &BTreeMap<(u64, usize), Entry>, address: u64) -> Option<u64> {
+    map.range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end > address)
+        .map(|(_, e)| e.end)
+}
+
+/// [`find`] for an ask that only reads (a constant buffer, a shader
+/// resource view, a vertex or index buffer, a root view that is not
+/// unordered access): with `crate::flat` on, the window of the mirror that
+/// holds it if the mirror may take it, else as [`find`].
+pub(crate) fn find_read(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if let Some(shadow) = crate::flat::find(address, len) {
+        return Some(shadow);
+    }
+    find(address, len)
+}
+
+/// [`find_any`] for an ask that only reads, as [`find_read`].
+pub(crate) fn find_any_read(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if let Some(shadow) = crate::flat::find(address, len) {
+        return Some(shadow);
+    }
+    find_any(address, len)
 }
 
 /// The title buffer holding `address`, as (start, length), without making
