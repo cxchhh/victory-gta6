@@ -3510,6 +3510,9 @@ mod local_debug_tests {
                 eprintln!("{name}: {:?}", super::idiom::wave_local(&f, &st));
             }
         }
+    }
+}
+
 /// The paired form (#854) with a wide title-memory load that crosses a 64 KiB page (#846), in
 /// one console wave64 program of 64 threads, checked lane by lane on both halves of the host
 /// wave. The same program also ORs a wave value inside a per-lane branch closed by
