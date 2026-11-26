@@ -47,8 +47,13 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || (TAKE.load(std::sync::atomic::Ordering::Relaxed)..TAKE.load(std::sync::atomic::Ordering::Relaxed).saturating_add(3)).contains(&n)
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
+
+/// The frame a `take` file asked for ([`frame_drew`]), if any.
+static TAKE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
 /// the frame's `frame-<n>-ops.txt`, one line per draw, dispatch, copy or
@@ -154,6 +159,20 @@ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    // A file named `take` in the capture folder: the three frames after the
+    // next one (the next is being recorded already) are [`listed`] (a frame
+    // the title records across a present lands under two numbers: run
+    // take1's one frame stopped at its shadows and G-buffer), at any time
+    // in the run: its pictures, its `ops.txt` and, with
+    // `VICTORY_DUMP_TARGETS`, every target it renders to or writes. The
+    // file is removed. (As `crate::shot`'s trigger, for this capture,
+    // which sees the targets passes write through unordered access too.)
+    if let Some(folder) = folder()
+        && std::fs::remove_file(folder.join("take")).is_ok()
+    {
+        TAKE.store(frame + 2, Relaxed);
+        tracing::info!(frame = frame + 2, "capture: frame asked for by the file `take`");
+    }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
     if world_on()
@@ -416,7 +435,9 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1
+            || !matches!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -494,6 +515,41 @@ fn dump_one(
                 (v.len(), v.into_iter().take(12).collect::<Vec<_>>())
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
+        }
+        // A small single-channel float texture (a curve, a lookup table, an
+        // exposure): its values as they are, beside the picture
+        // (`<name>.f32`, little-endian), and what they hold at its ends.
+        if f.Format.0 == 41 && u64::from(f.Width) * u64::from(f.Height) <= 1 << 16 {
+            let mut values = Vec::with_capacity((f.Width * f.Height) as usize);
+            for y in 0..f.Height as usize {
+                for x in 0..f.Width as usize {
+                    let at = y * pitch + x * 4;
+                    values.push(f32::from_le_bytes(rows[at..at + 4].try_into().unwrap_or([0; 4])));
+                }
+            }
+            let nan = values.iter().filter(|v| v.is_nan()).count();
+            let inf = values.iter().filter(|v| v.is_infinite()).count();
+            let finite = values.iter().copied().filter(|v| v.is_finite());
+            let (lo, hi) = finite.fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v), b.max(v)));
+            let ends = |v: &[f32]| v.iter().map(|x| format!("{x:e}")).collect::<Vec<_>>().join(" ");
+            let n = values.len();
+            tracing::info!(
+                ?resource,
+                width = f.Width,
+                height = f.Height,
+                nan,
+                inf,
+                low = lo,
+                high = hi,
+                first = %ends(&values[..n.min(6)]),
+                last = %ends(&values[n.saturating_sub(6)..]),
+                "float target values"
+            );
+            if let Some(folder) = folder() {
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let name = format!("frame-{frame}-{i:02}-{resource:?}-{}x{}-f41.f32", d.Width, d.Height);
+                let _ = std::fs::write(folder.join(name), bytes);
+            }
         }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
