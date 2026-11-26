@@ -79,6 +79,11 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The newest submission known finished.
+pub(crate) fn finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// Microseconds of a submission's preparing by part, since the frame-rate
 /// line last took them: the asking and the look under flights, the lists'
 /// steps, the flush of refreshes, the snapshots and the wait for card
@@ -9318,13 +9323,20 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 ),
             ]);
+            // The frame's view marks, out for reading, and cleared
+            // (`crate::marks`).
+            let marks = crate::marks::record(self, list);
             copy.close();
             match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
                     p.ahead[i].1 = flown;
+                    crate::marks::sent(marks, flown);
                 }
-                None => self.execute(&[copy]),
+                None => {
+                    self.execute(&[copy]);
+                    crate::marks::sent(marks, finished());
+                }
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {

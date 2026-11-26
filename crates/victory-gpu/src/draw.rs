@@ -894,6 +894,11 @@ pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
 pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Texture views made null because no shader read them lately with the
+/// card full, and ones made again because a shader then read them, since
+/// the start (`crate::marks`, `HostHeap::evict_unmarked`).
+pub(crate) static VIEW_MARKS_EVICTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static VIEW_MARKS_BACK: AtomicU64 = AtomicU64::new(0);
 /// Since the start: looks at a slot uploaded in part that found no more of
 /// its memory mapped; uploads of textures not all mapped; and of those,
 /// the ones whose first page was not there (asked by the first page alone,
@@ -1641,6 +1646,21 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_MARKS {
+                    // Ours: where shaders note the views they read.
+                    if let Some(gpu) = crate::marks::address() {
+                        // SAFETY: an open list; the buffer lives as long as
+                        // the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -2416,6 +2436,32 @@ impl State {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
         }
+        // View marks (`crate::marks`): slots made null for want of room
+        // that a shader read since come back first; with the card full,
+        // texture views no shader read for `VICTORY_MARKS_IDLE` presents
+        // (60) are made null so that their host copies make room, at most
+        // once a second and 8,192 slots at a time.
+        let back = host.requeue_marked(frame);
+        if !room {
+            static IDLE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let idle = *IDLE.get_or_init(|| {
+                std::env::var("VICTORY_MARKS_IDLE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(60)
+            });
+            static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            let due = {
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                let due = last.is_none_or(|t| t.elapsed().as_millis() >= 1000);
+                if due {
+                    *last = Some(std::time::Instant::now());
+                }
+                due
+            };
+            if due {
+                let evicted = host.evict_unmarked(idle, 8192);
+                VIEW_MARKS_EVICTED.fetch_add(evicted as u64, Ordering::Relaxed);
+            }
+        }
+        VIEW_MARKS_BACK.fetch_add(back as u64, Ordering::Relaxed);
         let mut refused = 0;
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).

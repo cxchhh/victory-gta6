@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -72,6 +72,23 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+
+/// The root UAV `u<SLOT_MARKS>` in [`ROOT_CBV_SPACE`]: which views of the
+/// view heap shaders read. Every handle a shader makes from the view heap
+/// for reading (not a sampler, not an unordered access view) stores 1 at
+/// dword `slot + 1` of this raw buffer (dword 0 is a sink): from the first
+/// lane of the wave for an index that is the same in every lane, from
+/// every lane for one that is not. The host clears it every frame and reads
+/// it back, so a texture's host copy is made, kept and uploaded for the
+/// shaders that read it, not for every view the title's 720,000-slot heap
+/// names (`victory-gpu` `marks.rs`). `VICTORY_VIEW_MARKS=0`: none.
+pub const SLOT_MARKS: u8 = 251;
+
+/// Whether shaders mark the views they read ([`SLOT_MARKS`]).
+pub fn view_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_none_or(|v| v != "0"))
+}
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -94,6 +111,10 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// `[earlydepthstencil]`.
+    pub const EARLY_DEPTH: u64 = 1 << 3;
+    /// Unordered access views outside pixel and compute shaders.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -181,6 +202,10 @@ pub(crate) struct Shader {
     pub rov: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// View marks stored ([`SLOT_MARKS`]), and the (block, index) pairs
+    /// already marked.
+    pub marks: u32,
+    marked: std::collections::HashSet<(usize, V)>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -238,6 +263,8 @@ impl Shader {
             flags: 0,
             rov: false,
             nonuniform_handles: 0,
+            marks: 0,
+            marked: std::collections::HashSet::new(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -500,6 +527,11 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        // (Only with a host heap's size: the marks buffer has a dword per
+        // slot up to it, and an index is clamped to it above.)
+        if !sampler && props.0 & 0x1000 == 0 && limit != 0 && view_marks() {
+            self.mark_view(block, index, nonuniform);
+        }
         self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
@@ -511,6 +543,44 @@ impl Shader {
             &[index, s, n],
         );
         self.annotate(block, h, props.0, props.1)
+    }
+
+    /// Stores the mark of the view at heap slot `index` ([`SLOT_MARKS`]),
+    /// once per block and index: from the wave's first lane when every lane
+    /// has the same index (the others store to the sink, dword 0), from
+    /// each lane when not.
+    fn mark_view(&mut self, block: usize, index: V, nonuniform: bool) {
+        if !self.marked.insert((block, index)) {
+            return;
+        }
+        // Never rasterizer ordered ([`Self::annotate`]): the marks need no
+        // order, and an ordered view would make every pixel wait.
+        let rov = std::mem::replace(&mut self.rov, false);
+        let marks = self.root_uav_handle(SLOT_MARKS);
+        self.rov = rov;
+        let one = self.m.i32(1);
+        let two = self.m.i32(2);
+        let slot = self.m.bin(block, Bin::Add, index, one);
+        let mut at = self.m.bin(block, Bin::Shl, slot, two);
+        if !nonuniform {
+            let i1 = self.t.i1;
+            let first = self.op(block, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+            self.flags |= flags::WAVE_OPS;
+            let sink = self.m.i32(0);
+            at = self.m.select(block, first, at, sink);
+        }
+        let i32t = self.t.i32;
+        let undef = self.m.undef(i32t);
+        let (void, mask, align) = (self.t.void, self.m.i8(1), self.m.i32(4));
+        self.op(
+            block,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[marks, at, undef, one, undef, undef, undef, mask, align],
+        );
+        self.marks += 1;
     }
 
     /// The finished container.
@@ -770,6 +840,26 @@ impl Shader {
         } else {
             None
         };
+        // View marks ([`SLOT_MARKS`]). A pixel shader that writes through an
+        // unordered access view runs its depth test after the shader on the
+        // host unless it says otherwise: one whose only such writes are the
+        // marks, that discards nothing and writes no depth, coverage or
+        // stencil, gives the same image with the test before it (as before
+        // the marks), and says so. A vertex, geometry or mesh shader with
+        // marks declares unordered access views outside pixel and compute.
+        if self.marks > 0 {
+            if self.pixel {
+                let (discard, others) = self.m.writes(i64::from(SLOT_MARKS), i64::from(ROOT_CBV_SPACE));
+                let exports = self.outputs.iter().any(|o| matches!(o.kind, 14 | 17..=20));
+                if !discard && others == 0 && !exports {
+                    self.flags |= flags::EARLY_DEPTH;
+                }
+            } else if self.threads.is_none() || self.mesh.is_some() {
+                // (Vertex, geometry and mesh shaders alike: the validator
+                // wants it of every stage but pixel and compute.)
+                self.flags |= flags::UAVS_EVERY_STAGE;
+            }
+        }
         // A pixel shader with an SV_StencilRef output (as DXC collects it).
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
@@ -863,6 +953,9 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
+        }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;

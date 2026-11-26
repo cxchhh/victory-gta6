@@ -77,6 +77,10 @@ pub(crate) struct HostHeap {
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     textures: Mutex<TextureQueue>,
+    /// Title slots made null again because no shader read them for a while
+    /// with the card full ([`HostHeap::evict_unmarked`]): made again from
+    /// the queue as soon as a shader marks one ([`HostHeap::requeue_marked`]).
+    evicted: Mutex<std::collections::BTreeSet<u32>>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -648,6 +652,10 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+/// Presents within which a slot a shader marked is served before the rest
+/// of the queue ([`TextureQueue::due`]).
+const MARKED_FIRST: u32 = 8;
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -690,17 +698,28 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let mut marked: Vec<(u64, u32, u64)> = Vec::new();
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            // Ahead of all: the ones a shader read in the last few frames
+            // (`crate::marks`): the frame draws with them now.
+            let class = if crate::marks::recent(index, MARKED_FIRST) {
+                &mut marked
+            } else if w.looks > 0 || w.mapped > 0 {
+                &mut again
+            } else {
+                &mut fresh
+            };
             class.push((w.written, index, w.write));
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        marked.sort_unstable_by(newest_first);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut order: Vec<(u32, u64)> =
+            marked.iter().chain(&again).map(|&(_, index, write)| (index, write)).collect();
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
             order.push((fresh[new].1, fresh[new].2));
@@ -1099,6 +1118,7 @@ impl HostHeap {
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
+            evicted: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -1719,6 +1739,84 @@ impl HostHeap {
         self.unmake(&mut made, index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// View marks (`crate::marks`), with the card full: the title slots
+    /// that view a texture for reading and that no shader read in the last
+    /// `presents` presents are made null again, up to `most` of them, so
+    /// that their host copies can go (`crate::resource::let_go_idle`; a
+    /// slot keeps what it views). The card then holds the textures the
+    /// frames draw with rather than every texture the title's heap names.
+    /// A slot made null reads zeros until a shader marks it, which brings
+    /// it back ([`HostHeap::requeue_marked`]). Returns how many.
+    pub(crate) fn evict_unmarked(&self, presents: u32, most: usize) -> usize {
+        if !crate::marks::on() || self.views.is_none() {
+            return 0;
+        }
+        // Slots holding a texture nothing read lately (under `kept`, then
+        // under `made` as `unmake` takes them: the same order).
+        let candidates: Vec<u32> = {
+            let kept = locked(&self.kept, 11);
+            kept.iter()
+                .enumerate()
+                .take(self.count as usize)
+                .filter(|(i, r)| {
+                    r.as_ref().is_some_and(|r| {
+                        // SAFETY: a live resource.
+                        unsafe { r.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+                    }) && !crate::marks::recent(*i as u32, presents)
+                })
+                .map(|(i, _)| i as u32)
+                .take(most)
+                .collect()
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0;
+        for index in candidates {
+            let Some(&key) = made.get(index as usize) else { continue };
+            if key == 0 || crate::marks::recent(index, presents) {
+                continue;
+            }
+            // A view that reads: not an unordered access view, not a
+            // constant buffer.
+            let reads = match view_at(key as u32, (key >> 32) as u32) {
+                Some(View::Shader(..)) => true,
+                Some(View::Placed(unordered, ..)) => !unordered,
+                _ => false,
+            };
+            if !reads {
+                continue;
+            }
+            self.unmake(&mut made, index);
+            evicted.insert(index);
+            n += 1;
+        }
+        n
+    }
+
+    /// The slots [`HostHeap::evict_unmarked`] made null that a shader read
+    /// since (it read zeros there): due again at `frame`, ahead of the
+    /// queue ([`TextureQueue::due`] serves marked slots first). Returns how
+    /// many.
+    pub(crate) fn requeue_marked(&self, frame: u64) -> usize {
+        let mut evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
+        if evicted.is_empty() {
+            return 0;
+        }
+        let back: Vec<u32> = evicted.iter().copied().filter(|&s| crate::marks::recent(s, 4)).collect();
+        if back.is_empty() {
+            return 0;
+        }
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        for &index in &back {
+            evicted.remove(&index);
+            textures.changed(index, frame, frame);
+        }
+        back.len()
     }
 
     /// Makes host slot `index` null again, as it is before its view is

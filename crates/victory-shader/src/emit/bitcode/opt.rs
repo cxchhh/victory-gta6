@@ -994,6 +994,64 @@ impl Module {
         self.drop_unused_tables();
     }
 
+    /// Over the blocks reached from the entry: whether a `discard` is
+    /// called, and how many stores and atomics write through a handle that
+    /// is not the root UAV `u<skip>` of `space` (the view marks'
+    /// [`crate::emit::shader::SLOT_MARKS`]): what `[earlydepthstencil]`
+    /// would change for a pixel shader.
+    pub(crate) fn writes(&self, skip: i64, space: i64) -> (bool, u32) {
+        let reached = self.reached();
+        let call = |v: V, name: &str| -> Option<&Vec<V>> {
+            let V::Inst(i) = v else { return None };
+            let Op::Call(f, args) = &self.insts[i as usize].op else {
+                return None;
+            };
+            (self.funcs[*f as usize].name == name).then_some(args)
+        };
+        // An annotated handle made from the binding `u<skip>` in `space`.
+        let ours = |h: V| -> bool {
+            let Some(args) = call(h, "dx.op.annotateHandle") else {
+                return false;
+            };
+            let Some(args) = args.get(1).and_then(|&h| call(h, "dx.op.createHandleFromBinding")) else {
+                return false;
+            };
+            let Some(&V::Const(bind)) = args.get(1) else {
+                return false;
+            };
+            let Const::Aggregate(fields) = &self.consts[bind as usize].1 else {
+                return false;
+            };
+            let int = |i: usize| match fields.get(i).map(|&c| &self.consts[c as usize].1) {
+                Some(Const::Int(v)) => Some(*v),
+                _ => None,
+            };
+            int(0) == Some(skip) && int(2) == Some(space)
+        };
+        let (mut discard, mut others) = (false, 0);
+        for (_, blk) in self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
+            for &i in &blk.body {
+                let Op::Call(f, args) = &self.insts[i as usize].op else {
+                    continue;
+                };
+                let name = self.funcs[*f as usize].name.as_str();
+                let Some(name) = name.strip_prefix("dx.op.") else { continue };
+                if name == "discard" {
+                    discard = true;
+                } else if (name.starts_with("bufferStore")
+                    || name.starts_with("rawBufferStore")
+                    || name.starts_with("textureStore")
+                    || name.starts_with("atomic")
+                    || name.starts_with("bufferUpdateCounter"))
+                    && !args.get(1).is_some_and(|&h| ours(h))
+                {
+                    others += 1;
+                }
+            }
+        }
+        (discard, others)
+    }
+
     /// See [`Usage`]: over the blocks reached from the entry.
     pub(crate) fn usage(&self) -> Usage {
         let mut u = Usage::default();
