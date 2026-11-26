@@ -519,6 +519,22 @@ impl Layout {
         self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
     }
 
+    /// For each axis (x, y, z), the address bit inside a block that each
+    /// element coordinate bit lands on, lowest coordinate bit first: what
+    /// [`Layout::offset`] adds for a position inside a block is the sum of
+    /// `1 << bits[i]` over the set coordinate bits `i`. Empty for linear
+    /// and unsupported modes (and z of thin layouts). For detilers outside
+    /// this crate (the host GPU's), which must address as this one does.
+    pub fn coordinate_bits(&self) -> [Vec<u32>; 3] {
+        self.pattern.clone().map(|table| {
+            if table.len() < 2 {
+                return Vec::new();
+            }
+            let n = table.len().trailing_zeros();
+            (0..n).map(|i| table[1 << i].trailing_zeros()).collect()
+        })
+    }
+
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
     fn split(&self, z: u32) -> (u32, u32) {
@@ -912,6 +928,38 @@ mod tests {
             let mut deep = desc(1, 1, 1, 16, swizzle);
             deep.depth = u32::MAX;
             assert_eq!(Layout::new(&deep), Err(Error::Invalid));
+        }
+    }
+
+    /// The coordinate bits spread back into the pattern tables the
+    /// addressing uses, for every element size and block of the thin and
+    /// thick modes.
+    #[test]
+    fn coordinate_bits_spread_into_the_patterns() {
+        for swizzle in [Swizzle::SW_256B_S, Swizzle::SW_256B_D, Swizzle::SW_4KB_S, Swizzle::SW_4KB_D, Swizzle::SW_64KB_S, Swizzle::SW_64KB_D] {
+            for bpe in [1, 2, 4, 8, 16] {
+                let mut d = desc(256, 256, 1, bpe, swizzle);
+                for thick in [false, true] {
+                    if thick {
+                        if !swizzle.standard() || swizzle.block_log2() == Some(8) {
+                            continue;
+                        }
+                        d.dimension = Dimension::Tex3d;
+                        d.depth = 64;
+                    }
+                    let layout = Layout::new(&d).unwrap();
+                    let bits = layout.coordinate_bits();
+                    for axis in 0..3 {
+                        let table = &layout.pattern[axis];
+                        if table.len() >= 2 {
+                            assert_eq!(&spread(&bits[axis]), table, "{swizzle:?} {bpe} axis {axis}");
+                            assert_eq!(table.len(), layout.block[axis] as usize);
+                        } else {
+                            assert!(bits[axis].is_empty());
+                        }
+                    }
+                }
+            }
         }
     }
 
