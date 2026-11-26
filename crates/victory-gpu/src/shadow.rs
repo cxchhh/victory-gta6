@@ -2826,6 +2826,7 @@ impl Shadow {
         crate::trace::refresh(crate::trace::list_id(list), address, len);
         #[cfg(feature = "diagnostics")]
         crate::writewatch::reads(address as usize, len as usize);
+        crate::flat::census_refresh(address, len);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
@@ -2892,6 +2893,7 @@ impl Shadow {
         let len = len.min(self.left(address));
         #[cfg(feature = "diagnostics")]
         crate::writewatch::writes(address as usize, len as usize);
+        crate::flat::census_gpu_writes(address, len);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -2918,6 +2920,7 @@ impl Shadow {
         if pending.contains(&range) {
             return;
         }
+        crate::flat::census_writing(address, len);
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
@@ -3771,6 +3774,7 @@ impl Shadow {
         let _reads_as = crate::backreads::reading_as(crate::backreads::REFRESH, self.id);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        crate::flat::census_copied(from, to);
         if self.card.is_some() && from < to && copy_changed() && self.copy_changed(from, to) {
             // SAFETY: inside the mapping; the CPU side now holds title memory.
             crate::trace::copied(from, unsafe { self.data.add(from - start) }, to - from);
@@ -4742,6 +4746,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    crate::flat::census_exact(address, len);
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (tick, map) = &mut *guard;
     *tick += 1;
