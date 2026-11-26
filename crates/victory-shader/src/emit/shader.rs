@@ -116,6 +116,24 @@ pub fn view_marks() -> bool {
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
+/// `RootType::Other` code of a user-data dword the host computes for the
+/// descriptor table of root parameter `slot`: the byte offset (32 bytes a
+/// slot) of a table of its own that holds only the table's constant buffer
+/// views, in the order of their offsets in the table (the used-resource
+/// list's entries of kind CBV), copied for the draw. The shader reads every
+/// constant buffer of that table from there and the table's other views
+/// from the title's own slots, so a draw copies its constant buffers alone
+/// rather than every view of every table that holds one (190,000 slots a
+/// frame, the dynamic slots ran out: run mk1). `VICTORY_CBV_SPLIT=0`: off.
+pub const USER_CBV_TABLE: u32 = 0x104;
+
+/// Whether constant buffers read through tables come from tables of their
+/// own ([`USER_CBV_TABLE`]); a program that picks one by an index it
+/// computes is translated without (see `lower::CBV_SPLIT_REFUSED`).
+pub fn cbv_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_SPLIT").is_none_or(|v| v != "0"))
+}
 /// `RootType::Other` code of a user-data dword the host computes: the low
 /// 32 bits of the title address of the buffer view at dword `dword` of the
 /// descriptor table of root parameter `slot`; [`USER_VIEW_ADDRESS`] + 1:
