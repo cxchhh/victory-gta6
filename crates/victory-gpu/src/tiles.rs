@@ -46,8 +46,13 @@
 //! Only for a texture the title places in memory and fills, two-dimensional,
 //! one layer, more than one level, of [`floor`] bytes or more, whose memory
 //! is not all its own when the host copy is made (`resource.rs` `hosted`);
-//! every other texture is made as before. Off unless
-//! `VICTORY_LEVELS_ON_DEMAND=1`.
+//! every other texture is made as before. On by default (cxchhh fork);
+//! `VICTORY_LEVELS_ON_DEMAND=0` turns it off. On a 12 GB card (RTX 4070),
+//! with it off the title's textures fill the card's budget and some
+//! 17,000 to 25,000 wait for room for the rest of the run: 70% of the
+//! world's pixels had a G-buffer albedo of exactly 0 (black walls, read as
+//! black shadows); with it on, 4.3 GB of levels the title does not hold
+//! take no memory and 2.6% did (runs cap1 and lod1, 2026-11-26).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -72,13 +77,13 @@ const HEAP_TILES: u32 = 1024;
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
+/// (`VICTORY_LEVELS_ON_DEMAND`; on unless `0`), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "0") {
             return false;
         }
         let Some(host) = host() else {
@@ -99,7 +104,7 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=0 turns it off)"
         );
         on
     })

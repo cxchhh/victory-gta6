@@ -600,10 +600,13 @@ Card memory (the test card is full from the first frame of the world: 85 to
 99 % of its budget for a whole run, about 26,000 texture copies let go and
 3,400 made again in five minutes, 2.8 GB of render targets that are all in
 use):
-- Levels on demand, **off by default** (`VICTORY_LEVELS_ON_DEMAND=1`): a
-  texture the title fills takes card memory only for the levels the title
-  holds (2.2 to 3.0 GB of the copies were levels it does not hold). Its test
-  runs on the software adapter; it has not run on a card yet.
+- Levels on demand (`VICTORY_LEVELS_ON_DEMAND`; **on by default** in this
+  fork since 2026-11-26, `=0` turns it off): a texture the title fills
+  takes card memory only for the levels the title holds (2.2 to 3.0 GB of
+  the copies were levels it does not hold). On the RTX 4070 (12 GB), with it
+  off, 70% of the world's pixels had a G-buffer albedo of exactly 0 (black
+  walls that read as black shadows: their textures waited for room for the
+  whole run); with it on, 2.6%.
 - Refused texture slots are held back for a few seconds so that a pass
   reaches the slots behind them (`VICTORY_FULL_CARD_PASS=0` = as before);
   room can be kept for the card copies of title buffers
