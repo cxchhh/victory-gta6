@@ -2571,6 +2571,158 @@ mod barycentric_tests {
         emit(&c, &native, &p, &st, &io, &res)
     }
 
+    /// A waterfall loop over `v_readfirstlane_b32` in a pixel shader whose quads are partly
+    /// covered: every pixel, helper lanes included, holds a value of its own, and a lane is
+    /// served in the pass whose first-lane value equals its own. The loop stops after `BOUND`
+    /// passes, so a lane never served ends with -1 rather than hanging the GPU. Covered pixels
+    /// export their own result, their quad neighbour's (DPP quad_perm: how a helper lane's
+    /// work reaches a covered pixel) and their own value. Without a helper lane reading its
+    /// own value (upstream 0601955) no helper is ever served. Needs `VICTORY_PC_DXC` (the PC
+    /// dxc.exe) for the vertex shader.
+    #[test]
+    #[cfg(windows)]
+    fn a_waterfall_loop_serves_helper_lanes_in_its_first_pass() {
+        const POS_X_FLOAT: u32 = 1 << 8;
+        const POS_Y_FLOAT: u32 = 1 << 9;
+        const V: u32 = 256;
+        const EXEC_LO: u32 = 126;
+        const VCC_LO: u32 = 106;
+        const BOUND: u32 = 64;
+        let Some(dxc) = std::env::var_os("VICTORY_PC_DXC").map(std::path::PathBuf::from) else {
+            eprintln!("VICTORY_PC_DXC (the PC dxc.exe) is not set; not run");
+            return;
+        };
+        let vop2 = |op: u32, vdst: u32, src0: u32, vsrc1: u32| op << 25 | vdst << 17 | vsrc1 << 9 | src0;
+        let vop1 = |op: u32, vdst: u32, src0: u32| 0x7E00_0000 | vdst << 17 | op << 9 | src0;
+        let vopc = |op: u32, src0: u32, vsrc1: u32| 0x7C00_0000 | op << 17 | vsrc1 << 9 | src0;
+        let sop1 = |op: u32, sdst: u32, src0: u32| 0xBE80_0000 | sdst << 16 | op << 8 | src0;
+        let sop2 = |op: u32, sdst: u32, src0: u32, src1: u32| 0x8000_0000 | op << 23 | sdst << 16 | src1 << 8 | src0;
+        let sopc = |op: u32, src0: u32, src1: u32| 0xBF00_0000 | op << 16 | src1 << 8 | src0;
+        let sopp = |op: u32, simm: i32| 0xBF80_0000 | op << 16 | (simm as u32 & 0xFFFF);
+        let mut w: Vec<u32> = Vec::new();
+        w.extend([vop2(0x08, 2, 255, 1), 100f32.to_bits()]); // v_mul_f32 v2, 100.0, v1
+        w.push(vop2(0x03, 2, V, 2)); // v_add_f32 v2, v0, v2: x + 100 y, one per pixel
+        w.push(vop1(0x01, 3, 243)); // v_mov_b32 v3, -1.0: not served
+        w.push(vop1(0x01, 7, 244)); // v_mov_b32 v7, 2.0: written
+        w.push(sop1(0x03, 10, 128)); // s_mov_b32 s10, 0
+        w.push(sop1(0x03, 11, EXEC_LO)); // s_mov_b32 s11, exec_lo
+        let top = w.len();
+        w.push(vop1(0x02, 12, V + 2)); // v_readfirstlane_b32 s12, v2
+        w.push(vopc(0xC2, 12, 2)); // v_cmp_eq_u32 vcc_lo, s12, v2
+        w.push(sop1(0x3C, 13, VCC_LO)); // s_and_saveexec_b32 s13, vcc_lo
+        w.push(vop1(0x06, 3, 10)); // v_cvt_f32_u32 v3, s10
+        w.push(vop2(0x03, 3, 242, 3)); // v_add_f32 v3, 1.0, v3: served in pass v3 - 1
+        w.push(sop2(0x12, EXEC_LO, EXEC_LO, 13)); // s_xor_b32 exec_lo, exec_lo, s13
+        w.push(sop2(0x00, 10, 10, 129)); // s_add_u32 s10, s10, 1
+        w.push(sopc(0x0A, 10, 128 + BOUND)); // s_cmp_lt_u32 s10, BOUND
+        let to_done = w.len();
+        w.push(0); // s_cbranch_scc0 done
+        let back = w.len();
+        w.push(sopp(0x09, top as i32 - back as i32 - 1)); // s_cbranch_execnz top
+        let done = w.len();
+        w[to_done] = sopp(0x04, done as i32 - to_done as i32 - 1);
+        w.push(sop1(0x03, EXEC_LO, 11)); // s_mov_b32 exec_lo, s11
+        w.extend([vop1(0x01, 4, 250), 0xFF00_0000 | 0xB1 << 8 | 3]); // v_mov_b32_dpp v4, v3 quad_perm:[1,0,3,2]
+        w.extend([0xF800_180F, 3 | 4 << 8 | 2 << 16 | 7 << 24]); // exp mrt0 v3, v4, v2, v7 done vm
+        w.push(0xBF81_0000);
+        // As `pixel`, with SV_Position (row 1) in the input signature for POS_X/Y_FLOAT.
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![PsInput { usage: Usage::Generic, row: 0, mask: 0b1111, attr: 0, flat: false, fp16: false, pack2: false, row2: 0 }],
+                input_addr: POS_X_FLOAT | POS_Y_FLOAT,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: w.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        };
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let mut position = element("SV_Position", 3, 1);
+        position.interp = 4;
+        let isg1 = container::signature(&[element("TEXCOORD", 0, 0), position], true);
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let ps = emit(&c, &native, &p, &st, &io, &res).expect("the waterfall program translates");
+        validate(&ps);
+        // The vertex shader: TEXCOORD0 before SV_Position, as the translation's inputs are.
+        let dir = std::env::temp_dir().join(format!("victory-helper-lanes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("vs.hlsl"), dir.join("vs.bin"));
+        std::fs::write(&src, "struct O { float4 tc : TEXCOORD0; float4 pos : SV_Position; };\nO main(float4 p : POSITION, float2 uv : TEXCOORD0) { O o; o.pos = p; o.tc = float4(uv, 0, 1); return o; }\n").unwrap();
+        let r = std::process::Command::new(&dxc).args(["-T", "vs_6_6", "-E", "main", "-Fo"]).arg(&out).arg(&src).output().unwrap();
+        assert!(r.status.success(), "vertex shader: {}", String::from_utf8_lossy(&r.stderr));
+        let vs = HostShader {
+            stage: crate::HwStage::Vs,
+            dxil: std::fs::read(&out).unwrap(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        };
+        // A triangle whose edges cross the 16x16 target: partly covered quads.
+        let vertices = [
+            -0.9, -0.9, 0.5, 1.0, 0.0, 0.0, //
+            -0.9, 0.75, 0.5, 1.0, 0.0, 0.0, //
+            0.65, -0.9, 0.5, 1.0, 0.0, 0.0,
+        ];
+        let (mut failures, mut edges, mut ran) = (Vec::new(), 0, 0);
+        for warp in [false, true] {
+            let backend = if warp { "WARP" } else { "hardware" };
+            let Ok(host) = super::host::Host::new(warp) else {
+                eprintln!("no SM 6.6 {backend} device; not run there");
+                continue;
+            };
+            let (root, pso) = host.pipeline(&vs, &ps).unwrap_or_else(|e| panic!("{backend}: pipeline: {e}"));
+            let draw = super::host::Draw { roots: vec![], textures: &[], samplers: &[], vertices: &vertices, stride: 24, size: (16, 16), mesh_groups: 0 };
+            let t = host.draw(&root, &pso, &draw).unwrap_or_else(|e| panic!("{backend}: draw: {e}"));
+            ran += 1;
+            let written = |x: usize, y: usize| t[y * 16 + x][3] == 2.0;
+            let (mut covered, mut own_ok, mut value_ok, mut inner, mut inner_ok, mut edge, mut served) = (0, 0, 0, 0, 0, 0, 0);
+            for y in 0..16 {
+                for x in 0..16 {
+                    if !written(x, y) {
+                        continue;
+                    }
+                    let px = t[y * 16 + x];
+                    covered += 1;
+                    own_ok += (px[0] >= 1.0) as u32;
+                    value_ok += (px[2] == x as f32 + 0.5 + 100.0 * (y as f32 + 0.5)) as u32;
+                    let nx = x ^ 1;
+                    if written(nx, y) {
+                        inner += 1;
+                        inner_ok += (px[1] == t[y * 16 + nx][0]) as u32;
+                    } else {
+                        edge += 1;
+                        served += (px[1] >= 1.0) as u32;
+                    }
+                }
+            }
+            edges += edge;
+            eprintln!("{backend}: {covered} pixels; own served {own_ok}, own value {value_ok}, covered neighbour {inner_ok}/{inner}; helper neighbour served {served}/{edge}");
+            if own_ok != covered || value_ok != covered || inner_ok != inner || served != edge {
+                failures.push(format!("{backend}: own {own_ok}/{covered}, value {value_ok}/{covered}, covered neighbour {inner_ok}/{inner}, helper neighbour served {served}/{edge}"));
+            }
+        }
+        if ran == 0 {
+            return;
+        }
+        assert!(edges > 0, "no covered pixel with a helper neighbour: the test saw nothing");
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     /// The translation's `SFI0` features and `ISG1` rows.
     fn parts(shader: &HostShader) -> (u64, Vec<SigElement>) {
         let c = Container::parse(&shader.dxil).unwrap();
@@ -3318,5 +3470,168 @@ mod local_debug_tests {
                 eprintln!("{name}: {:?}", super::idiom::wave_local(&f, &st));
             }
         }
+/// The paired form (#854) with a wide title-memory load that crosses a 64 KiB page (#846), in
+/// one console wave64 program of 64 threads, checked lane by lane on both halves of the host
+/// wave. The same program also ORs a wave value inside a per-lane branch closed by
+/// `s_cbranch_scc0`, which outside the paired form takes an approximate per-half form: with the
+/// paired form off the test must see wrong ORs, so it cannot pass without the paired form.
+/// Runs on a hardware device with 32-lane waves (WARP refuses `WaveSize(32)`).
+#[cfg(all(test, windows))]
+mod paired_boundary_tests {
+    use super::host::{Dispatch, Host, Root, View};
+    use super::{MEMORY_FAULTS, USER_MEMORY_BASE};
+    use super::*;
+    use crate::native::{ComputeIo, ResourceType, RootParam, StageIo, UsedResource};
+
+    const PAGE_DWORDS: usize = 0x10000 / 4;
+    const NEXT_PAGE: usize = 0x10000; // the high address dword carries at 4 GiB
+    const FIRST_BIAS: usize = 4;
+    const NEXT_BIAS: usize = 8;
+
+    fn native() -> NativeProgram {
+        // buffer_store_dword v<vdata>, v13, s[8:11], 0 offen offset:<off>
+        let st = |vdata: u32, off: u32| [0xE070_1000 | off, 0x8002_000D | vdata << 8];
+        let mut w = vec![
+            0xBE85_0380, 0x3D << 26 | 0x02 << 18 | 8 << 6 | 2, 125 << 25, // s_mov_b32 s5, 0; s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0x7E04_0201, // v_mov_b32 v2, s1
+            0xDC00_8000 | 0x0D << 18, 10 << 24 | 0x7D << 16 | 1, // global_load_dwordx2 v[10:11], v[1:2], off
+            0x341A_0084, // v_lshlrev_b32 v13, 4, v0: the lane's 16 bytes
+        ];
+        w.extend(st(10, 0));
+        w.extend(st(11, 4));
+        w.extend([
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+            0x340E_0B06, // v_lshlrev_b32 v7, v6, v5: bit t >> 1
+            0x7D88_0002, // v_cmp_gt_u32 vcc, s2, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF84_0000 | 23, // s_cbranch_scc0 past the body
+        ]);
+        w.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+        w.push(0x7E18_0207); // v_mov_b32 v12, s7
+        w.extend(st(12, 8));
+        w.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+        w.push(0xBF81_0000);
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![
+                RootParam { root: RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+                RootParam { root: RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+            ],
+            used: vec![UsedResource { kind: ResourceType::Uav, root: RootType::Table, table_offset_dwords: 0, lower_bound: 0, stride: 0, dwords: 4, user_data: 4, slot: 1 }],
+            io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [64, 1, 1] }),
+            code: w.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        }
+    }
+
+    /// `pairs`: the paired form on or off for `emit`; `None`: `paired` itself.
+    fn translate(pairs: Option<bool>) -> Result<(HostShader, Option<u32>), ShaderError> {
+        let nat = native();
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).expect("container");
+        let p = ir::build(&nat.code, nat.wave64, nat.vgprs)?;
+        let st = structure::structure(&p)?;
+        let io = io::raise(&p, &nat)?;
+        let res = resource::track(&p, &nat.layout, nat.stage, Some(&st))?;
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let before = TEST_PAIRS.replace(Some(pairs != Some(false)));
+        let r = match pairs {
+            None => paired(&c, &nat, &p, &io, &res),
+            Some(_) => emit(&c, &nat, &p, &st, &io, &res).map(|s| (s, None)),
+        };
+        TEST_PAIRS.set(before);
+        lower::TEST_HOST_WAVE.set(was);
+        r
+    }
+
+    /// The wave's OR of bit t >> 1 over the threads below `bound`.
+    fn or_below(bound: u32) -> u32 {
+        if bound == 0 {
+            return 0;
+        }
+        let top = (bound.min(64) - 1) / 2 + 1;
+        if top >= 32 { u32::MAX } else { (1u32 << top) - 1 }
+    }
+
+    #[test]
+    fn paired_lanes_split_a_wide_title_memory_load_at_the_page_boundary() {
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return;
+        };
+        let first_end = FIRST_BIAS + PAGE_DWORDS;
+        let first = vec![0x11u32; first_end + 4];
+        let next = vec![0x22u32; NEXT_BIAS + 16];
+        let mut directory = vec![0u32; 2 * (NEXT_PAGE + 1)];
+        directory[2 * (NEXT_PAGE - 1)..2 * NEXT_PAGE].copy_from_slice(&[1, 4 * FIRST_BIAS as u32]);
+        directory[2 * NEXT_PAGE..].copy_from_slice(&[2, 4 * NEXT_BIAS as u32]);
+        let address = 0u32.wrapping_sub(4); // one dword before the page boundary
+        let mut results = Vec::new();
+        for (name, pairs) in [("paired form on", Some(true)), ("paired itself", None), ("paired form off", Some(false))] {
+            let shader = match translate(pairs) {
+                Ok((s, wave)) => {
+                    if pairs.is_none() {
+                        assert_eq!(wave, Some(32), "the paired form runs on 32-lane waves");
+                    }
+                    s
+                }
+                Err(e) => {
+                    eprintln!("{name}: does not translate: {e:?}");
+                    results.push((name, false));
+                    continue;
+                }
+            };
+            let (root, pso) = match host.compute_pipeline(&shader) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+                    return;
+                }
+            };
+            let mut all_ok = true;
+            for bound in [64u32, 40, 33, 10, 1, 0] {
+                let mut constants = vec![0; shader.user_data_dwords() as usize];
+                for word in &shader.user_data {
+                    constants[word.index as usize] = match (word.root, word.dword) {
+                        (RootType::Constants, 0) => address,
+                        (RootType::Constants, 2) => bound,
+                        (RootType::Constants | RootType::Table, _) => 0,
+                        (RootType::Other(USER_MEMORY_BASE), _) => 1,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let out = host
+                    .dispatch(&root, &pso, &Dispatch {
+                        roots: vec![(0, Root::Constants(constants)), (1, Root::OutputUav(3)), (2, Root::View { srv: true, data: directory.clone() })],
+                        views: &[View::RawUav(256), View::NullRawUav, View::RawUavData(&first), View::RawUavData(&next), View::RawUavData(&[0; MEMORY_FAULTS as usize])],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    })
+                    .unwrap_or_else(|e| panic!("{name}: dispatch: {e}"));
+                let (mut load_bad, mut or_bad) = ([0u32; 2], [0u32; 2]);
+                for lane in 0..64usize {
+                    let half = lane / 32;
+                    let r = &out[0][lane * 4..lane * 4 + 3];
+                    load_bad[half] += (r[0] != 0x11 || r[1] != 0x22) as u32;
+                    let want = if (lane as u32) < bound { or_below(bound) } else { 0 };
+                    or_bad[half] += (r[2] != want) as u32;
+                }
+                let faults = out[3][1..].iter().filter(|&&page| page != 0).count();
+                let ok = load_bad == [0, 0] && or_bad == [0, 0] && faults == 0;
+                all_ok &= ok;
+                if !ok {
+                    eprintln!("{name}, bound {bound}: load wrong in lanes 0-31/32-63 {}/{}, OR wrong {}/{}, page faults {faults}", load_bad[0], load_bad[1], or_bad[0], or_bad[1]);
+                }
+            }
+            results.push((name, all_ok));
+        }
+        eprintln!("{results:?}");
+        assert!(results.contains(&("paired form on", true)), "emit with the paired form on: wrong");
+        assert!(results.contains(&("paired itself", true)), "the paired form itself: wrong");
+        assert!(results.contains(&("paired form off", false)), "with the paired form off the program must go wrong (or not translate): the test does not tell the paired form apart");
     }
 }
