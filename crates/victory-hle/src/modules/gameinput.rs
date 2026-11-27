@@ -68,22 +68,25 @@ const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. A is Space and
+/// Enter, Y is F, the sticks' clicks are left Shift and the middle mouse
+/// button (the layout Vice-Tay's players are used to).
+const FALLBACK_BUTTONS: [(u8, u32); 15] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
+    (0x20, A),    // Space
     (0x0D, A),    // Enter
     (0x08, B),    // Backspace
     (b'X', X),
-    (b'Y', Y),
+    (b'F', Y),
     (0x26, UP), // arrows
     (0x28, DOWN),
     (0x25, LEFT),
     (0x27, RIGHT),
     (b'Q', LEFT_SHOULDER),
     (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
-    (b'H', RIGHT_STICK),
+    (0xA0, LEFT_STICK),  // left Shift
+    (0x04, RIGHT_STICK), // middle mouse button
 ];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
@@ -1299,9 +1302,11 @@ mod host {
             }
             let mut down = scripted();
             if focused() {
-                // Left/right modifier keys only, as devices report them; no
-                // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
+                // Left/right modifier keys only, as devices report them; of
+                // the mouse buttons (below 0x08) only the middle one, which
+                // clicks the stand-in pad's right stick.
+                let held: Vec<u8> = std::iter::once(0x04_u8)
+                    .chain(0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
