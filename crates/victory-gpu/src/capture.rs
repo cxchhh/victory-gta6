@@ -47,7 +47,36 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || burst(n) || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// On demand: a file named `take` in the capture folder (its text a count
+/// of frames, 8 if empty) makes the frames after the one being built
+/// listed (pictures, targets with `VICTORY_DUMP_TARGETS`, operations), and
+/// is removed. Looked for at most every quarter second.
+fn burst(n: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static FROM: AtomicU64 = AtomicU64::new(u64::MAX);
+    static TO: AtomicU64 = AtomicU64::new(0);
+    static LOOKED: AtomicU64 = AtomicU64::new(0);
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let last = LOOKED.load(Relaxed);
+    if now >= last + 250
+        && LOOKED.compare_exchange(last, now, Relaxed, Relaxed).is_ok()
+        && let Some(folder) = folder()
+    {
+        let take = folder.join("take");
+        if let Ok(text) = std::fs::read_to_string(&take) {
+            let _ = std::fs::remove_file(&take);
+            let count: u64 = text.trim().parse().unwrap_or(8).clamp(1, 64);
+            let start = crate::queue::presented() + 2;
+            TO.store(start + count, Relaxed);
+            FROM.store(start, Relaxed);
+            tracing::info!(from = start, count, "capture: frames taken on demand (the `take` file)");
+        }
+    }
+    (FROM.load(Relaxed)..TO.load(Relaxed)).contains(&n)
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
