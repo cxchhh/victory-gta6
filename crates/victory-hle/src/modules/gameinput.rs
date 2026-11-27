@@ -74,7 +74,7 @@ const POLL: Duration = Duration::from_millis(8);
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
+    (0x20, A),    // Space
     (0x08, B),    // Backspace
     (b'X', X),
     (b'Y', Y),
@@ -84,8 +84,8 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x27, RIGHT),
     (b'Q', LEFT_SHOULDER),
     (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
-    (b'H', RIGHT_STICK),
+    (0xA0, LEFT_STICK),  // left Shift
+    (0x04, RIGHT_STICK), // middle mouse button
 ];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
