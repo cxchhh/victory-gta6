@@ -32,11 +32,21 @@ fn fnv(state: &mut [u64; 2], bytes: &[u8]) {
 }
 
 fn main() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // The crate's folder as cargo gives it to this run, not as it was when
+    // this script was compiled: worktrees share a target folder, and a
+    // script compiled in another one (or in one since removed) hashed no
+    // file at all, so the key never changed with the translator (run tex3:
+    // `VICTORY_SHADER_SOURCE_HASH` was FNV's starting state, no switch
+    // listed, every translation a cache hit after the translator changed).
+    let dir = std::env::var_os("CARGO_MANIFEST_DIR").map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
+    let src = dir.join("src");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     let mut list = Vec::new();
     files(&src, &mut list);
+    if list.is_empty() {
+        println!("cargo:warning=no translator source found under {}: the shader cache key will not follow it", src.display());
+    }
     list.sort();
     let mut state = [0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64];
     let mut switches = std::collections::BTreeSet::new();
