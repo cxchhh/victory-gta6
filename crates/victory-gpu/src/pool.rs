@@ -621,6 +621,107 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
     unseen.get(&raw).copied().filter(|&begun| begun > finished)
 }
 
+/// Whether blocks of textures are made by a thread of their own
+/// (`VICTORY_BLOCKS_ASIDE`, on; `=0`: by the thread that needs one, as
+/// before).
+pub(crate) fn blocks_aside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_BLOCKS_ASIDE").is_none_or(|v| v != "0"))
+}
+
+/// Blocks kept ready by the thread of blocks (`VICTORY_BLOCKS_READY`, 3).
+fn ready_target() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_BLOCKS_READY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3).clamp(1, 32)
+    })
+}
+
+/// The thread of blocks: keeps [`ready_target`] empty blocks of texture
+/// memory made, resident and mapped, so that the threads that make textures
+/// only cut pieces from them.
+struct Aside {
+    ready: Mutex<Vec<ID3D12Heap>>,
+    wake: std::sync::Condvar,
+    want: std::sync::atomic::AtomicBool,
+}
+
+static ASIDE: std::sync::OnceLock<Aside> = std::sync::OnceLock::new();
+
+/// Since the start: blocks made by the thread, their milliseconds, the
+/// longest; textures that found none ready (and made one as before).
+pub(crate) static ASIDE_COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A ready block, if there is one; asks the thread for more either way.
+fn aside_take(device: &ID3D12Device) -> Option<ID3D12Heap> {
+    let aside = ASIDE.get_or_init(|| {
+        struct Device(ID3D12Device);
+        // SAFETY: D3D12 devices are free-threaded.
+        unsafe impl Send for Device {}
+        let device = Device(device.clone());
+        let _ = std::thread::Builder::new().name("victory-blocks".into()).spawn(move || {
+            let device = device;
+            aside_run(&device.0);
+        });
+        Aside { ready: Mutex::new(Vec::new()), wake: std::sync::Condvar::new(), want: std::sync::atomic::AtomicBool::new(true) }
+    });
+    let block = aside.ready.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    aside.want.store(true, Ordering::Relaxed);
+    aside.wake.notify_one();
+    if block.is_none() {
+        ASIDE_COUNTS[3].fetch_add(1, Ordering::Relaxed);
+    }
+    block
+}
+
+fn aside_run(device: &ID3D12Device) {
+    let Some(aside) = ASIDE.get() else {
+        // (Set right after the thread is made: wait for it.)
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        return aside_run(device);
+    };
+    loop {
+        {
+            let ready = aside.ready.lock().unwrap_or_else(|e| e.into_inner());
+            if ready.len() >= ready_target() {
+                let (_ready, _) = aside
+                    .wake
+                    .wait_timeout_while(ready, std::time::Duration::from_millis(100), |_| {
+                        !aside.want.swap(false, Ordering::Relaxed)
+                    })
+                    .unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+        }
+        let started = std::time::Instant::now();
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: BLOCK,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain creation.
+        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+            crate::residency::allocation_error(&e);
+            tracing::warn!(error = %e, "the thread of blocks: no block of texture memory");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
+        let Some(heap) = heap else { continue };
+        if let Err(e) = crate::host::resident(device, &heap).and_then(|()| crate::host::mapped(device)) {
+            tracing::warn!(error = %e, "the thread of blocks: a block of texture memory is not resident");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
+        let us = started.elapsed().as_micros() as u64;
+        ASIDE_COUNTS[0].fetch_add(1, Ordering::Relaxed);
+        ASIDE_COUNTS[1].fetch_add(us, Ordering::Relaxed);
+        ASIDE_COUNTS[2].fetch_max(us, Ordering::Relaxed);
+        aside.ready.lock().unwrap_or_else(|e| e.into_inner()).push(heap);
+    }
+}
+
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
@@ -666,7 +767,17 @@ pub(crate) unsafe fn texture(
         return None;
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let asynchronous = blocks_aside();
     let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+        if asynchronous {
+            // Made by the thread of blocks ([`Aside`]), not on this one,
+            // which records the frame (`MakeResident` of a new block on a
+            // full card took up to 1.4 s, a hitch at each turn of the
+            // camera). Without one ready, made here as before.
+            if let Some(block) = aside_take(device) {
+                return Some(block);
+            }
+        }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },

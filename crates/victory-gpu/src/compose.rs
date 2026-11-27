@@ -43,13 +43,17 @@ unsafe impl Send for Composer {}
 unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
+    compile_source(SOURCE, entry, target)
+}
+
+fn compile_source(source: &str, entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
     unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("compose"),
             None,
             None,
@@ -184,6 +188,151 @@ impl Composer {
                 right: width as i32,
                 bottom: height as i32,
             }]);
+            list.DrawInstanced(3, 1, 0, 0);
+        }
+        Ok(())
+    }
+}
+
+/// The interface's opacity for DLSS Frame Generation (`kBufferTypeUIAlpha`):
+/// 0 where the presented picture is the colour without the interface, else
+/// how much of it is interface, so that `shown = ui + (1 - alpha) * hudless`
+/// (Streamline's guide). One plane (Series X): 1 wherever the presented
+/// texture differs from the copy taken in front of the title's interface
+/// composite (there the interface's colour is the picture's own). Two planes
+/// (Series S): the interface plane's alpha, sampled as [`Composer`] does.
+/// The caller clears our own boxes (panel, notice, menu) to 1 over it.
+const ALPHA_SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=3), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+Texture2D<float4> shown : register(t0);
+Texture2D<float4> hudless : register(t1);
+Texture2D<float4> over : register(t2);
+SamplerState smooth_ : register(s0);
+struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
+[RootSignature(RS)]
+V vs(uint id : SV_VertexID) {
+    V v;
+    v.uv = float2((id << 1) & 2, id & 2);
+    v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return v;
+}
+[RootSignature(RS)]
+float ps(V v) : SV_Target {
+    int3 at = int3(int2(v.at.xy), 0);
+    float3 s = shown.Load(at).rgb;
+    float3 h = hudless.Load(at).rgb;
+    float3 d = abs(s - h);
+    // Two steps of an 8-bit channel (relative above 1, for HDR colours): a
+    // composite that only rounds is not taken for interface.
+    float tolerance = (2.0 / 255.0) * max(1.0, max(max(abs(h.r), abs(h.g)), abs(h.b)));
+    if (max(max(d.r, d.g), d.b) > tolerance) {
+        return 1;
+    }
+    return saturate(over.SampleLevel(smooth_, v.uv, 0).a);
+}
+"#;
+
+/// The format of [`InterfaceAlpha`]'s target.
+pub(crate) const ALPHA_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8_UNORM;
+
+/// Draws [`ALPHA_SOURCE`] into an [`ALPHA_FORMAT`] target.
+pub(crate) struct InterfaceAlpha {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    views: Vec<ID3D12DescriptorHeap>,
+    step: u32,
+}
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for InterfaceAlpha {}
+
+impl InterfaceAlpha {
+    pub(crate) fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
+        let (vs, ps) = (
+            compile_source(ALPHA_SOURCE, s!("vs"), s!("vs_5_1"))?,
+            compile_source(ALPHA_SOURCE, s!("ps"), s!("ps_5_1"))?,
+        );
+        // SAFETY: the blobs' own bytes, alive through the calls.
+        unsafe {
+            let bytes = |b: &ID3DBlob| std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize());
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE { pShaderBytecode: b.GetBufferPointer(), BytecodeLength: b.GetBufferSize() };
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code(&vs),
+                PS: code(&ps),
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = ALPHA_FORMAT;
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            let pso = device.CreateGraphicsPipelineState(&desc)?;
+            Ok(InterfaceAlpha {
+                root,
+                pso,
+                views: Vec::new(),
+                step: device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            })
+        }
+    }
+
+    /// Records the draw into `target` (a render target now, of that size):
+    /// `inputs` are the presented texture, the colour without the interface
+    /// (both of that size) and the interface plane if there is one, with the
+    /// formats they are read in, all readable by pixel shaders now. `slot` as
+    /// [`Composer::record`]'s: its views are made again only once the list
+    /// that last used them has run.
+    pub(crate) fn record(
+        &mut self,
+        device: &ID3D12Device,
+        slot: usize,
+        list: &ID3D12GraphicsCommandList,
+        inputs: [(Option<&ID3D12Resource>, DXGI_FORMAT); 3],
+        target: D3D12_CPU_DESCRIPTOR_HANDLE,
+        (width, height): (u32, u32),
+    ) -> windows::core::Result<()> {
+        while self.views.len() <= slot {
+            // SAFETY: plain creation.
+            let heap = unsafe {
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 3,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })?
+            };
+            self.views.push(heap);
+        }
+        let views = &self.views[slot];
+        // SAFETY: an open list; views of a slot no frame in flight reads;
+        // live textures, or typed null views (read as 0).
+        unsafe {
+            let (cpu, gpu) = (views.GetCPUDescriptorHandleForHeapStart(), views.GetGPUDescriptorHandleForHeapStart());
+            for (i, (texture, format)) in inputs.iter().enumerate() {
+                let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + i * self.step as usize };
+                let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: *format,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+                };
+                device.CreateShaderResourceView(*texture, Some(&desc), at);
+            }
+            list.OMSetRenderTargets(1, Some(&target), false, None);
+            list.SetDescriptorHeaps(&[Some(views.clone())]);
+            list.SetGraphicsRootSignature(&self.root);
+            list.SetPipelineState(&self.pso);
+            list.SetGraphicsRootDescriptorTable(0, gpu);
+            list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.RSSetViewports(&[D3D12_VIEWPORT { Width: width as f32, Height: height as f32, MaxDepth: 1.0, ..Default::default() }]);
+            list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 }]);
             list.DrawInstanced(3, 1, 0, 0);
         }
         Ok(())

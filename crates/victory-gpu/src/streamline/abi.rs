@@ -73,6 +73,8 @@ pub const BUFFER_SCALING_OUTPUT_COLOR: u32 = 4;
 pub const BUFFER_EXPOSURE: u32 = 13;
 pub const BUFFER_UI_COLOR_AND_ALPHA: u32 = 23;
 pub const BUFFER_BIAS_CURRENT_COLOR_HINT: u32 = 29;
+/// `kBufferTypeUIAlpha` (the jump table of `getBufferTypeAsStr` in sl.dlss_g.dll 2.14).
+pub const BUFFER_UI_ALPHA: u32 = 69;
 
 // `sl::ResourceType` (a char).
 pub const RESOURCE_TEX2D: u8 = 0;

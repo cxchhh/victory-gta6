@@ -1651,6 +1651,9 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        if kind == victory_shader::emit::USER_FRAME {
+            return crate::seen::stamp();
+        }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
@@ -2124,6 +2127,22 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_READS {
+                    // Ours: where shaders note the heap slots they read.
+                    let gpu = crate::seen::gpu();
+                    if gpu != 0 {
+                        // SAFETY: an open list; the buffer lives as long as
+                        // the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -3103,6 +3122,14 @@ impl State {
             // Slots whose texture's memory the runtime mapped, unmapped or
             // wrote since the last pass are due again.
             host.texture_slots_remapped(frame);
+            // Read feedback (`crate::seen`): slots made neutral that the
+            // card read again are due; a part of the walk that finds the
+            // textures not read lately, to let them go while the card is
+            // short.
+            host.texture_slots_wake(frame);
+            if !baking {
+                host.texture_slots_evict(frame);
+            }
             if baking {
                 host.texture_slots_bake_written(frame);
             }
@@ -3220,6 +3247,12 @@ impl State {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
+        // (Not for a bake's sources, nor a pass that must serve them.)
+        let defer_unread = victory_shader::emit::read_feedback_mode() >= 2
+            && !baking
+            && !required
+            && sync.is_none()
+            && (!room || crate::resource::evict_need() > 0);
         let mut tells = Tells { host, told: Vec::with_capacity(Tells::BATCH) };
         use crate::descriptor::host::Told;
         for ((index, write), knew) in due.into_iter().zip(known) {
@@ -3358,7 +3391,11 @@ impl State {
             // before.
             if !room {
                 let has_its_texture = reupload_when_full()
-                    && rest(1, || heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)));
+                    && rest(1, || heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)))
+                    // (Or a slot made neutral by read feedback and read
+                    // again, whose texture's host copy is still there.)
+                    || crate::seen::on()
+                        && rest(1, || heap.handle(index).is_some_and(|handle| host.texture_slot_copy_alive(handle)));
                 if !has_its_texture {
                     refused += 1;
                     outcome(slot_outcome::HELD);
@@ -3383,6 +3420,16 @@ impl State {
                         "a texture already on the card is brought up to date although the card has no room for new ones"
                     );
                 }
+            }
+            // Demand paging (read feedback in every program, the card short):
+            // a slot the card has not read lately waits, neutral, for a read.
+            if defer_unread
+                && !rest(1, || host.texture_slot_read_lately(index, frame))
+                && let Some(handle) = heap.handle(index)
+                && rest(1, || host.texture_slot_defer(index, handle, frame))
+            {
+                tells.tell(index, write, Told::Done(None));
+                continue;
             }
             // Gate new host texture creation / staging on commit reserve after
             // `mapped == 0` reclamation (`texture_slot_gone`) has run, and

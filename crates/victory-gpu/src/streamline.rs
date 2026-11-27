@@ -1510,6 +1510,212 @@ fn hudless_for(shown: &ID3D12Resource) -> Option<ID3D12Resource> {
     first.map(|c| c.texture)
 }
 
+/// `VICTORY_FRAMEGEN_UIR=0`: no interface alpha is tagged and DLSS Frame
+/// Generation's user interface recomposition stays off (frame generation
+/// then tells the interface from the colour without it alone, as before).
+/// Else, where a colour without the interface is tagged, so is the
+/// interface's alpha ([`interface_alpha`]: the title's interface and our own
+/// boxes, the panel, the notice and the menu), and recomposition is on: the
+/// scene and the interface are interpolated apart and the interface put back
+/// over the generated frame (Streamline's DLSS-G guide, 5.1 and 6.6), so a
+/// box that stands still stays as sharp on generated frames as on rendered
+/// ones (with the colour without the interface alone our boxes were taken
+/// into the interpolation).
+fn recomposition() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FRAMEGEN_UIR").map_or(true, |v| v.trim() != "0"))
+        && PLAN.get().is_some_and(|p| p.asked.hudless || p.asked.series_s)
+}
+
+/// What [`interface_alpha`] took and drew for the present of the host
+/// texture `shown` that follows it.
+struct Prepared {
+    shown: usize,
+    hudless: Option<ID3D12Resource>,
+    alpha: Option<ID3D12Resource>,
+}
+
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for Prepared {}
+
+static PREPARED: Mutex<Option<Prepared>> = Mutex::new(None);
+
+/// The interface alpha's pipeline and the two textures it is drawn into in
+/// turn (as the copies of the colour without the interface), of the back
+/// buffer's size.
+struct AlphaPass {
+    draw: crate::compose::InterfaceAlpha,
+    size: [u32; 2],
+    textures: [ID3D12Resource; 2],
+    next: usize,
+}
+
+// SAFETY: as above.
+unsafe impl Send for AlphaPass {}
+
+static ALPHA: Mutex<Option<AlphaPass>> = Mutex::new(None);
+static ALPHA_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// A presented plane: the texture, the state it is in in the list now and
+/// the format it is read in.
+pub(crate) struct Plane<'a> {
+    pub texture: &'a ID3D12Resource,
+    pub state: D3D12_RESOURCE_STATES,
+    pub format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+}
+
+/// While the host's present list is recorded, after everything is in the
+/// back buffer (`size`) and before it goes to the present, with DLSS Frame
+/// Generation wanted and [`recomposition`]: the interface's alpha of this
+/// frame, recorded into `list`, for [`present_begins`] to tag. One plane
+/// (`overlay` none): where the presented texture `base` differs from the
+/// copy taken in front of the title's interface composite (taken here for
+/// the present, as [`present_begins`] otherwise does); two planes: the
+/// interface plane's alpha. Then `boxes`, our own boxes copied into the back
+/// buffer, are interface (alpha 1). `slot`: the present list's, as the
+/// composite's. Nothing otherwise: the present goes as before.
+pub(crate) fn interface_alpha(
+    host: &crate::host::Host,
+    list: &crate::host::HostList,
+    slot: usize,
+    base: Plane<'_>,
+    overlay: Option<Plane<'_>>,
+    boxes: &[windows::Win32::Foundation::RECT],
+    size: [u32; 2],
+) {
+    lock(&PREPARED).take();
+    if ALPHA_FAILED.load(Relaxed)
+        || !FG_READY.load(Acquire)
+        || !SWAP_CHAIN_PROXIED.load(Acquire)
+        || framegen_wanted() == 0
+        || (!crate::queue::line_on() && !CHECKING.load(Relaxed))
+        || !recomposition()
+    {
+        return;
+    }
+    let hudless = match overlay {
+        Some(_) => None,
+        None if hudless_wanted() => hudless_for(base.texture),
+        None => return,
+    };
+    let alpha = if overlay.is_some() || hudless.is_some() {
+        draw_alpha(host, list, slot, &base, overlay.as_ref(), hudless.as_ref(), boxes, size)
+    } else {
+        None
+    };
+    *lock(&PREPARED) = Some(Prepared { shown: base.texture.as_raw() as usize, hudless, alpha });
+}
+
+/// [`interface_alpha`]'s draw; the texture drawn, left readable by shaders.
+#[allow(clippy::too_many_arguments)]
+fn draw_alpha(
+    host: &crate::host::Host,
+    list: &crate::host::HostList,
+    slot: usize,
+    base: &Plane<'_>,
+    overlay: Option<&Plane<'_>>,
+    hudless: Option<&ID3D12Resource>,
+    boxes: &[windows::Win32::Foundation::RECT],
+    size: [u32; 2],
+) -> Option<ID3D12Resource> {
+    use crate::host::transition;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    // (The copy is made in the presented texture's swap-chain format: an
+    // sRGB texture would be read in another space than its copy.)
+    // SAFETY: a live texture.
+    let hudless_format = hudless.map_or(base.format, |copy| unsafe { copy.GetDesc() }.Format);
+    if hudless_format != base.format {
+        once!(
+            warn,
+            presented = base.format.0,
+            copy = hudless_format.0,
+            "DLSS Frame Generation: the presented texture and its copy without the interface are read in different formats; no interface alpha is drawn"
+        );
+        return None;
+    }
+    let began = std::time::Instant::now();
+    let mut pass = lock(&ALPHA);
+    if pass.as_ref().is_none_or(|p| p.size != size) {
+        // (A new size comes after the swap chain's buffers are made again,
+        // with nothing sent still running.)
+        let device = &host.device;
+        let kept = pass.take().map(|p| p.draw);
+        let made = (|| -> windows::core::Result<AlphaPass> {
+            let draw = match kept {
+                Some(draw) => draw,
+                None => crate::compose::InterfaceAlpha::new(device)?,
+            };
+            let make = || texture(device, size, crate::compose::ALPHA_FORMAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, SHADER_READ);
+            Ok(AlphaPass { draw, size, textures: [make()?, make()?], next: 0 })
+        })();
+        match made {
+            Ok(made) => *pass = Some(made),
+            Err(e) => {
+                ALPHA_FAILED.store(true, Relaxed);
+                tracing::warn!(error = %e, "DLSS Frame Generation: no pass for the interface's alpha; none is tagged (recomposition has nothing to put back)");
+                return None;
+            }
+        }
+    }
+    let pass = pass.as_mut()?;
+    let target = pass.textures[pass.next % 2].clone();
+    pass.next += 1;
+    const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    let (mut before, mut after) = (Vec::with_capacity(4), Vec::with_capacity(4));
+    let mut read = |texture: &ID3D12Resource, state: D3D12_RESOURCE_STATES| {
+        if state.0 & READ.0 == 0 {
+            before.push(transition(texture, state, READ));
+            after.push(transition(texture, READ, state));
+        }
+    };
+    read(base.texture, base.state);
+    if let Some(copy) = hudless {
+        read(copy, D3D12_RESOURCE_STATES(COPY_DEST as i32));
+    }
+    if let Some(over) = overlay {
+        read(over.texture, over.state);
+    }
+    let shader_read = D3D12_RESOURCE_STATES(SHADER_READ as i32);
+    before.push(transition(&target, shader_read, D3D12_RESOURCE_STATE_RENDER_TARGET));
+    after.push(transition(&target, D3D12_RESOURCE_STATE_RENDER_TARGET, shader_read));
+    let inputs = [
+        (Some(base.texture), base.format),
+        (Some(hudless.unwrap_or(base.texture)), hudless_format),
+        (overlay.map(|o| o.texture), overlay.map_or(DXGI_FORMAT_R8G8B8A8_UNORM, |o| o.format)),
+    ];
+    let rtv = host.rtv(Some(&target), None);
+    // SAFETY: an open list; the textures are in the states named, ours a
+    // shader resource between frames.
+    let drawn = unsafe {
+        list.list.ResourceBarrier(&before);
+        let drawn = pass.draw.record(&host.device, slot, &list.list, inputs, rtv, (size[0], size[1]));
+        if drawn.is_ok() && !boxes.is_empty() {
+            list.list.ClearRenderTargetView(rtv, &[1.0; 4], Some(boxes));
+        }
+        list.list.ResourceBarrier(&after);
+        drawn
+    };
+    list.keep(&target);
+    if let Some(copy) = hudless {
+        list.keep(copy);
+    }
+    spent(T_COPY, began);
+    if let Err(e) = drawn {
+        ALPHA_FAILED.store(true, Relaxed);
+        tracing::warn!(error = %e, "DLSS Frame Generation: the interface's alpha was not drawn; none is tagged from here on");
+        return None;
+    }
+    once!(
+        info,
+        width = size[0],
+        height = size[1],
+        two_planes = overlay.is_some(),
+        boxes = boxes.len(),
+        "DLSS Frame Generation: the interface's alpha (the title's interface and our boxes) is drawn for user interface recomposition (first time; VICTORY_FRAMEGEN_UIR=0: not)"
+    );
+    Some(target)
+}
+
 /// The planes a present shows (Series S: the scene and the interface over
 /// it), the host states they are in, and the back buffer's size.
 pub(crate) struct Planes<'a> {
@@ -1529,6 +1735,8 @@ pub(crate) struct Presenting {
 /// frame generation runs on it (it does when an upscaling was submitted
 /// since the last present).
 pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presenting> {
+    // What [`interface_alpha`] took and drew for this present, if it ran.
+    let prepared = lock(&PREPARED).take().filter(|p| p.shown == planes.base.0.as_raw() as usize);
     if !FG_READY.load(Acquire) || !SWAP_CHAIN_PROXIED.load(Acquire) {
         return None;
     }
@@ -1541,7 +1749,11 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     }
     // Where the interface is no plane of its own (Series X): the copy of
     // this texture taken in front of the title's interface composite.
-    let hudless = if planes.overlay.is_none() && hudless_wanted() { hudless_for(planes.base.0) } else { None };
+    let (hudless, alpha) = match prepared {
+        Some(p) => (p.hudless, p.alpha),
+        None if planes.overlay.is_none() && hudless_wanted() => (hudless_for(planes.base.0), None),
+        None => (None, None),
+    };
     let (sl, functions) = (SL.get()?, FUNCTIONS.get()?);
     let (set_options, marker) = (functions.dlssg_set_options?, functions.pcl_set_marker?);
     let began = std::time::Instant::now();
@@ -1601,6 +1813,12 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         } else if hudless_wanted() {
             HUD_COUNTS[HUD_MISSING].fetch_add(1, Relaxed);
         }
+        // With the colour without the interface: the interface's alpha
+        // (preferred to the interface plane's colour and alpha where both
+        // are tagged), for user interface recomposition.
+        if let Some(alpha) = alpha.as_ref().filter(|_| planes.overlay.is_some() || hudless.is_some()) {
+            resources.push((abi::Resource::texture(alpha.as_raw(), SHADER_READ), abi::BUFFER_UI_ALPHA, planes.size));
+        }
         let tags: Vec<abi::ResourceTag> = resources
             .iter_mut()
             .map(|(r, kind, size)| abi::ResourceTag::new(r, *kind, abi::VALID_UNTIL_PRESENT, abi::Extent::sized(*size)))
@@ -1618,6 +1836,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             back_buffer = ?planes.size,
             interface_plane = planes.overlay.is_some(),
             interface_free_copy = hudless.is_some(),
+            interface_alpha = alpha.is_some(),
             depth_state = format_args!("{:#x}", resources[0].0.state),
             motion_state = format_args!("{:#x}", resources[1].0.state),
             near = constants.camera_near,
@@ -1633,7 +1852,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         if calls.framegen_on {
             // No upscaling this frame (a menu, a load): what was tagged may
             // no longer hold what it did.
-            let tags = [abi::BUFFER_DEPTH, abi::BUFFER_MOTION_VECTORS, abi::BUFFER_HUDLESS_COLOR, abi::BUFFER_UI_COLOR_AND_ALPHA]
+            let tags = [abi::BUFFER_DEPTH, abi::BUFFER_MOTION_VECTORS, abi::BUFFER_HUDLESS_COLOR, abi::BUFFER_UI_COLOR_AND_ALPHA, abi::BUFFER_UI_ALPHA]
                 .map(|kind| abi::ResourceTag::new(std::ptr::null_mut(), kind, abi::VALID_UNTIL_PRESENT, abi::Extent::default()));
             // SAFETY: null tags.
             unsafe { (sl.set_tag_for_frame)(token, &viewport, tags.as_ptr(), tags.len() as u32, std::ptr::null_mut()) };
@@ -1681,9 +1900,12 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         options.color_width = planes.size[0];
         options.color_height = planes.size[1];
         options.on_error_callback = Some(present_error);
+        // The same at every call (a change makes Streamline make the
+        // feature again).
+        options.enable_user_interface_recomposition = abi::boolean(recomposition());
         // SAFETY: filled options for viewport 0, on the presenting thread.
         let code = unsafe { set_options(&viewport, &options) };
-        tracing::info!(frame, on, times = generated + 1, code, result = abi::result_name(code), "DLSS Frame Generation switched");
+        tracing::info!(frame, on, times = generated + 1, recomposition = recomposition(), code, result = abi::result_name(code), "DLSS Frame Generation switched");
         // 39, "warning: out of VRAM": the options are set all the same, with the card's memory
         // past its budget. Taken as set: asked again at every present (1,828 times in one
         // run, after the menu's 3X on a full 12 GB card) it showed no generated frame at all.
@@ -1914,6 +2136,8 @@ fn shut_down() -> Option<String> {
     }
     *lock(&SUBMITTED) = None;
     lock(&HUD_SUBMITTED).clear();
+    lock(&PREPARED).take();
+    lock(&ALPHA).take();
     // SAFETY: initialised; nothing of it is in use or called from here on.
     let code = unsafe { (sl.shutdown)() };
     Some(format!("Streamline shut down: {} ({code})", abi::result_name(code)))

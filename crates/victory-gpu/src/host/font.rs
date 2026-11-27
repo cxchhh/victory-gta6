@@ -1,4 +1,4 @@
-//! The dot letters the stats panel (`panel.rs`, diagnostics builds) and the settings menu
+//! The dot letters the stats panel (`panel.rs`) and the settings menu
 //! (`menu.rs`, every build) are written with, and the pixels they are painted in.
 
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -46,6 +46,9 @@ pub(super) const fn glyph(c: u8) -> [u8; 7] {
         b'.' => [0, 0, 0, 0, 0, 0b01100, 0b01100],
         b'/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
         b'-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        // For the stats panel's loads.
+        b'|' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        b'%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
         // For the settings menu (menu.rs).
         b'>' => [0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000],
         b'<' => [0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010],

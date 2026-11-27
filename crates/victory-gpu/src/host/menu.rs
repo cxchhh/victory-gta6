@@ -16,14 +16,15 @@
 //! (DLSS mode, frame generation, frame rate, console, picture size), which it
 //! turns into the layer's switches; the others are the switches themselves.
 //!
-//! In every build, as the stats panel is. Drawn as
-//! that panel is: white text on a black box, copied onto the swap chain's
+//! In every build, as the stats panel is. Drawn as the start's
+//! notice is: white text on a black box, copied onto the swap chain's
 //! buffer, in the middle of the picture.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -79,7 +80,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MENU_FG_TYPE", label: "FRAME GEN TYPE", values: &[("auto", "AUTO"), ("dlss", "DLSS"), ("fsr", "FSR 3 (OLDER CARDS)")], live: false },
     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
-    Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
+    Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3, F4)", values: &[("0", "OFF"), ("1", "ON"), ("fps", "FPS ONLY")], live: true },
     Item { var: "VICTORY_FULLSCREEN", label: "FULLSCREEN (NO BORDER)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
     Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
@@ -411,7 +412,7 @@ impl Menu {
             // Off (0) or the frames shown for each one rendered, from the next present on.
             "VICTORY_MENU_FRAMEGEN" => crate::streamline::set_framegen(value.parse().unwrap_or(0)),
             "VICTORY_FPS_LINE" => fps_line_on().store(value != "0", Ordering::Relaxed),
-            "VICTORY_PANEL" => super::panel::shown().store(value == "1", Ordering::Relaxed),
+            "VICTORY_PANEL" => super::panel::set(value),
             _ => {}
         }
     }
@@ -544,16 +545,17 @@ impl Menu {
         }
     }
 
-    /// Records the copy of the box onto `back` (in the copy-destination state).
-    pub(super) fn draw(&mut self, host: &Host, list: &HostList, back: &ID3D12Resource, (width, height): (u32, u32), format: DXGI_FORMAT) {
+    /// Records the copy of the box onto `back` (in the copy-destination state); where it lies,
+    /// if it is copied (DLSS Frame Generation takes it for interface).
+    pub(super) fn draw(&mut self, host: &Host, list: &HostList, back: &ID3D12Resource, (width, height): (u32, u32), format: DXGI_FORMAT) -> Option<RECT> {
         if self.failed {
-            return;
+            return None;
         }
         // Closed: the frame-rate line in the top left corner, if it is wanted and there is a rate.
         let open = Self::open();
         let line = if open { None } else { fps_line() };
         if !open && line.is_none() {
-            return;
+            return None;
         }
         // Our own copies are not part of a recorded frame (the recorder is in diagnostics builds).
         #[cfg(feature = "diagnostics")]
@@ -570,7 +572,7 @@ impl Menu {
             self.changed = true;
         }
         let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(), |l| vec![l.clone()])) } else { None };
-        let Some(buffers) = &mut self.buffers else { return };
+        let buffers = self.buffers.as_mut()?;
         if let Some(lines) = lines {
             self.changed = false;
             buffers.write(&lines);
@@ -610,6 +612,7 @@ impl Menu {
             let part = D3D12_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
             list.CopyTextureRegion(&to, x, y, 0, &from, Some(&part));
         }
+        Some(RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 })
     }
 }
 

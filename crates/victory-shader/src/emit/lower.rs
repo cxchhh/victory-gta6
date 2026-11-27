@@ -317,6 +317,11 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// Textures picked from the resource heap by index note their slot
+    /// (`super::read_feedback`, `shader.rs` `SLOT_READS`).
+    read_feedback: bool,
+    /// With it, a pixel program gets D3D12's early depth test declared.
+    feedback_early: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -1642,6 +1647,17 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let pixels = match &x.native.io {
+            StageIo::Ps { db_shader_control, .. } => Some(super::feedback_in_pixels(
+                *db_shader_control,
+                &s.outputs,
+                writes_uavs,
+                super::read_feedback_mode(),
+            )),
+            _ => None,
+        };
+        let read_feedback = super::read_feedback() && pixels != Some(super::PixelFeedback::None);
+        let feedback_early = pixels == Some(super::PixelFeedback::Early);
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -1950,6 +1966,8 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            read_feedback,
+            feedback_early,
             src0: None,
             console_lanes,
             split_lds,
@@ -7628,6 +7646,36 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Read feedback (`shader.rs` `SLOT_READS`): a texture picked from the
+    /// resource heap at slot `index` (computed, not a table's) stores the
+    /// frame's stamp at the slot's dword. Once per block and descriptor
+    /// (`handles`). In every lane that runs this, also lanes the console
+    /// would have masked off (a slot may be noted read that was not:
+    /// the host then keeps its texture a little longer).
+    fn note_read(&mut self, load: Site, index: V) {
+        use super::shader::{SLOT_READS, SLOT_STRIDES_COUNT, USER_FRAME};
+        let Some(a) = self.scalar.get(&load) else { return };
+        if self.x.native.layout.get(a.param).map(|p| p.root) != Some(RootType::ResourceHeap) {
+            return;
+        }
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+        // UMin: inside the buffer whatever the index (a root UAV has no bounds).
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        let k2 = self.s.m.i32(2);
+        let at = self.s.m.bin(c, Bin::Shl, slot, k2);
+        let stamp = self.host_word(RootType::Other(USER_FRAME), 0, 0);
+        let reads = self.s.root_uav_handle(SLOT_READS);
+        let c = self.cur;
+        let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(1), self.s.m.i32(4));
+        let void = self.s.t.void;
+        self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[reads, at, iu, stamp, iu, iu, iu, mask, align]);
+        if self.feedback_early {
+            self.s.flags |= flags::EARLY_DEPTH_STENCIL;
+        }
+    }
+
     /// For a root view the host binds as a raw view that may begin before
     /// the title's address (`shader.rs` `USER_VIEW_BIAS`): the bytes to add
     /// to offsets through it. Every root UAV (root SRVs keep the views they
@@ -7705,6 +7753,9 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
+                if !sampler && self.read_feedback {
+                    self.note_read(*load, index);
+                }
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).

@@ -369,3 +369,19 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
         assert_eq!(got[..2], [0, 6], "{label}");
     }
 }
+
+/// Read feedback (`VICTORY_READ_FEEDBACK=1`): a texture picked from the
+/// resource heap notes its slot through the root UAV `SLOT_READS`; without
+/// the switch nothing is added.
+#[test]
+fn a_heap_texture_notes_its_slot_with_read_feedback() {
+    let words = [TABLE, FROM_HEAP, SIZES, STORE].concat();
+    let off = build(&words, (8, 0)).expect("translates");
+    assert!(!off.root_uavs.contains(&super::SLOT_READS));
+    super::READ_FEEDBACK_FOR_TESTS.with(|on| on.set(Some(true)));
+    let on = build(&words, (8, 0));
+    super::READ_FEEDBACK_FOR_TESTS.with(|on| on.set(None));
+    let on = on.expect("translates with read feedback");
+    assert!(on.root_uavs.contains(&super::SLOT_READS), "{:?}", on.root_uavs);
+    assert!(on.user_data.iter().any(|u| u.root == crate::native::RootType::Other(super::USER_FRAME)));
+}

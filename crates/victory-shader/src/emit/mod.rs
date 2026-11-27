@@ -123,8 +123,8 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_READS, SLOT_STRIDES,
+    SLOT_STRIDES_COUNT, USER_FRAME, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -194,6 +194,84 @@ pub fn early_depth() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_some_and(|v| v == "1"))
+}
+
+/// Whether shaders store read feedback (`VICTORY_READ_FEEDBACK=1`, see
+/// `shader.rs` `SLOT_READS`). Off by default. Part of the translation: the
+/// shader cache keys on it (`victory-gpu`'s does, while it is on).
+pub fn read_feedback() -> bool {
+    read_feedback_mode() > 0
+}
+
+/// `VICTORY_READ_FEEDBACK`: 0 (unset) off; 1 every program but pixel
+/// programs that kill; 2 those too (they lose the hierarchical depth
+/// rejection D3D12 gives a program without stores). Part of the
+/// translation: the shader cache keys on it.
+pub fn read_feedback_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(on) = READ_FEEDBACK_FOR_TESTS.with(std::cell::Cell::get) {
+        return u8::from(on);
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_READ_FEEDBACK").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// Read feedback in a pixel program ([`feedback_in_pixels`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PixelFeedback {
+    /// None: it kills, and only mode 2 stores there.
+    None,
+    /// Stored, with D3D12's early depth test declared (nothing else of the
+    /// program changes: no kill, export or writes of its own).
+    Early,
+    /// Stored as it is: its depth test is late already (it exports depth,
+    /// stencil or coverage, writes memory itself, runs on a failed
+    /// hierarchical test), or it kills and mode 2 is on.
+    Late,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static READ_FEEDBACK_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a pixel program with the console's depth control
+/// `db_shader_control`, outputs `outputs` and UAV writes of its own
+/// (`writes_uavs`) stores read feedback ([`read_feedback`]), and how. One
+/// whose depth test D3D12 may take before it whatever it does (no kill, no
+/// depth, stencil or coverage export, no execution on a failed hierarchical
+/// test, no writes of its own) gets the early test declared; one tested late
+/// already stores as it is. A UAV store in a pixel program makes the
+/// test late unless the program declares the early one, and so every
+/// covered pixel of the overdraw would run it; such a program gets the
+/// early test declared ([`flags::EARLY_DEPTH_STENCIL`]), which changes
+/// nothing else for it. Programs that kill (alpha-tested foliage) store
+/// nothing: the textures only they read are never seen, and the host
+/// never lets go of a texture it has not seen read.
+pub(crate) fn feedback_in_pixels(
+    db_shader_control: u32,
+    outputs: &[container::SigElement],
+    writes_uavs: bool,
+    mode: u8,
+) -> PixelFeedback {
+    const KILL: u32 = 1 << 6;
+    // Z/stencil/stencil-op export, coverage to mask, mask export, execute
+    // on hierarchical fail, execute on no-op.
+    const LATE: u32 = 0b111 | 1 << 7 | 1 << 8 | 1 << 9 | 1 << 10;
+    // SV_Depth.., SV_StencilRef (17-20), SV_Coverage (14).
+    let exports = outputs.iter().any(|o| (17..=20).contains(&o.kind) || o.kind == 14);
+    if db_shader_control & KILL != 0 {
+        return if mode >= 2 { PixelFeedback::Late } else { PixelFeedback::None };
+    }
+    if db_shader_control & LATE != 0 || exports || writes_uavs {
+        PixelFeedback::Late
+    } else {
+        PixelFeedback::Early
+    }
 }
 
 /// What a pixel program gets of its console code's early depth test.

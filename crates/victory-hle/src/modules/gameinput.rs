@@ -1335,11 +1335,13 @@ mod host {
         }
     }
 
-    /// A scripted key's virtual key: a letter, a digit, or `Enter`, `Esc`,
-    /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
+    /// A scripted key's virtual key: a letter, a digit, or `Enter`, `Space`,
+    /// `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`, `Shift` (left).
     fn key_code(name: &str) -> Option<u8> {
         Some(match name.trim() {
             "Enter" => 0x0D,
+            "Space" => 0x20,
+            "Shift" => 0xA0,
             "Esc" => 0x1B,
             "Tab" => 0x09,
             "Back" => 0x08,

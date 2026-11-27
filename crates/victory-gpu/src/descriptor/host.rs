@@ -235,6 +235,83 @@ pub(crate) struct HostHeap {
     /// another's view made stale stays, which says only "may"): a write of
     /// any other view needs nothing of `placed` ([`spans_quick`]).
     spanned: Slots,
+    /// Read feedback (`crate::seen`): the slots made neutral because the
+    /// card had not read them for a while when its memory was short, each
+    /// with the stamp it was made neutral at ([`HostHeap::texture_slots_evict`]).
+    evicted: Mutex<std::collections::HashMap<u32, u32>>,
+    /// The walk over the slots that finds what to make neutral, a part a
+    /// pass ([`EvictScan`]).
+    evict_scan: Mutex<EvictScan>,
+}
+
+/// [`HostHeap::texture_slots_evict`]'s walk: where it is, the textures it
+/// found so far with their slots, the frame and time of the last walk's
+/// end and the frames a second since then (for the frames of
+/// [`EVICT_AFTER_MS`]).
+#[derive(Default)]
+struct EvictScan {
+    next: u32,
+    textures: std::collections::HashMap<usize, EvictTexture>,
+    ended: (u64, u64),
+    fps: u64,
+}
+
+/// A texture the walk found shown: the frames since its slots were last
+/// read (the fewest of them, by read feedback or through a table), whether
+/// one of them was never seen read (then it is never let go: a program
+/// that kills pixels stores no feedback), and its slots with what each was
+/// made from.
+#[derive(Default)]
+struct EvictTexture {
+    youngest: u32,
+    unknown: bool,
+    slots: Vec<(u32, u64)>,
+}
+
+/// How long a texture's slots must have gone unread before they are made
+/// neutral to let it go (`VICTORY_EVICT_AFTER_MS`).
+const EVICT_AFTER_MS: u64 = 6000;
+
+/// Slots looked at per pass by [`HostHeap::texture_slots_evict`]'s walk.
+const EVICT_PER_PASS: u32 = 1 << 16;
+
+/// Since the start: textures let go of by read feedback (their slots made
+/// neutral), their bytes, slots made neutral, slots woken by a read, walks
+/// ended, walks that found the card short, due slots left unread on a short
+/// card ([`HostHeap::texture_slot_defer`]).
+pub(crate) static EVICTED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Frames within which a slot counts as read lately
+/// ([`HostHeap::texture_slot_read_lately`]).
+const READ_LATELY_FRAMES: u32 = 30;
+
+/// At the last walk that found the card short: textures shown with a host
+/// copy, their bytes; of them never seen read (a slot with no stamp), their
+/// bytes; read within the age, their bytes.
+pub(crate) static SHOWN_LAST: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Whether a slot made from `view` gets the neutral texture when made
+/// neutral (a 2D texture or an array of them): others would read zeros.
+fn has_neutral(view: &View) -> bool {
+    let dimension = match view {
+        View::Shader(_, Some(desc)) => desc[1],
+        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
+        _ => 0,
+    };
+    matches!(dimension, 4 | 5)
+}
+
+/// The title texture a view shows, without making it (placed views name
+/// it by address and description).
+fn shown_texture(view: &View) -> Option<usize> {
+    match view {
+        View::Shader(resource, _) if *resource != 0 => Some(*resource),
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            crate::resource::placed_known(address, resource).map(|t| t as usize)
+        }
+        _ => None,
+    }
 }
 
 /// Since the last frame line: writes that left `placed` alone
@@ -2090,6 +2167,8 @@ impl HostHeap {
                 spans
             },
             spanned: Slots::new((count + extra) as usize),
+            evicted: Mutex::default(),
+            evict_scan: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2768,6 +2847,252 @@ impl HostHeap {
         self.unmake(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// Read feedback (`crate::seen`): walks a part of the slots each pass
+    /// (all of them in about `count / 65,536` passes); at a walk's end, while
+    /// the card's memory is over its aim (`crate::resource::evict_need`),
+    /// makes neutral every slot of the textures the card has not read for
+    /// [`EVICT_AFTER_MS`], those unread longest first, until their host
+    /// copies' bytes are what is needed. A texture with a slot never seen
+    /// read is left alone; so are the ones the host wrote into, holds in a
+    /// list or asked for within a second (`crate::resource::evictable`).
+    /// Their host copies go with a later sweep once nothing holds them
+    /// (`crate::resource::let_go_idle`); a slot read again meanwhile is woken
+    /// ([`HostHeap::texture_slots_wake`]) and shown again from the copy.
+    pub(crate) fn texture_slots_evict(&self, frame: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.sampler || !crate::seen::on() || self.tabled.is_empty() {
+            return;
+        }
+        let now = crate::seen::stamp_of(frame);
+        let tabled_now = now & !TABLED_READ;
+        let mut scan = self.evict_scan.lock().unwrap_or_else(|e| e.into_inner());
+        let end = scan.next.saturating_add(EVICT_PER_PASS).min(self.count);
+        for index in scan.next..end {
+            let Some(key) = self.made.get(index).filter(|&k| k != 0) else { continue };
+            let Some(view) = view_at(key as u32, (key >> 32) as u32) else { continue };
+            let Some(this) = shown_texture(&view) else { continue };
+            let read = crate::seen::last_read(index);
+            let tabled = self.tabled_stamp(index) & !TABLED_READ;
+            let e = scan.textures.entry(this).or_insert(EvictTexture { youngest: u32::MAX, ..Default::default() });
+            if read == 0 && tabled == 0 {
+                e.unknown = true;
+            }
+            if read != 0 {
+                e.youngest = e.youngest.min(now.wrapping_sub(read));
+            }
+            if tabled != 0 {
+                e.youngest = e.youngest.min(tabled_now.wrapping_sub(tabled) & !TABLED_READ);
+            }
+            e.slots.push((index, key));
+        }
+        scan.next = end;
+        if end < self.count {
+            return;
+        }
+        scan.next = 0;
+        let textures = std::mem::take(&mut scan.textures);
+        let ms = crate::host::now_ms();
+        let (last_frame, last_ms) = scan.ended;
+        if last_ms != 0 && ms > last_ms {
+            scan.fps = (frame.saturating_sub(last_frame) * 1000 / (ms - last_ms)).clamp(1, 240);
+        }
+        scan.ended = (frame, ms);
+        let fps = if scan.fps == 0 { 30 } else { scan.fps };
+        drop(scan);
+        EVICTED[4].fetch_add(1, Relaxed);
+        let need = crate::resource::evict_need();
+        if need == 0 {
+            return;
+        }
+        EVICTED[5].fetch_add(1, Relaxed);
+        static AFTER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let after = *AFTER.get_or_init(|| {
+            std::env::var("VICTORY_EVICT_AFTER_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(EVICT_AFTER_MS)
+        });
+        let after_ms = after;
+        // In frames, never under 90.
+        let after = (after * fps / 1000).max(90) as u32;
+        // Every program stores feedback (`VICTORY_READ_FEEDBACK=2`): a slot
+        // never seen read was not read, and its texture goes when nothing
+        // asked for it for the age either.
+        let everywhere = victory_shader::emit::read_feedback_mode() >= 2;
+        let mut shown = [0u64; 6];
+        let mut candidates: Vec<(u32, usize, u64, Vec<(u32, u64)>)> = Vec::new();
+        for (this, t) in textures {
+            let bytes = crate::resource::copy_state(this as crate::object::This).map_or(0, |(s, b, _)| if s == 2 { b } else { 0 });
+            shown[0] += u64::from(bytes > 0);
+            shown[1] += bytes;
+            if t.unknown {
+                shown[2] += u64::from(bytes > 0);
+                shown[3] += bytes;
+            } else if t.youngest < after {
+                shown[4] += u64::from(bytes > 0);
+                shown[5] += bytes;
+            }
+            let (age, idle_ms) = if t.unknown {
+                if !everywhere {
+                    continue;
+                }
+                (u32::MAX >> 2, after_ms)
+            } else {
+                (t.youngest, 1000)
+            };
+            if age < after || age >= 1 << 30 {
+                continue;
+            }
+            if let Some(bytes) = crate::resource::evictable(this as crate::object::This, idle_ms) {
+                candidates.push((age, this, bytes, t.slots));
+            }
+        }
+        for (count, now) in SHOWN_LAST.iter().zip(shown) {
+            count.store(now, Relaxed);
+        }
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let mut freed = 0u64;
+        for (_, this, bytes, slots) in candidates {
+            if freed >= need {
+                break;
+            }
+            let mut all = true;
+            for (index, key) in slots {
+                all &= self.demote(index, key, now, after);
+            }
+            if all {
+                freed += bytes;
+                crate::resource::evicted(this as crate::object::This, bytes);
+                EVICTED[0].fetch_add(1, Relaxed);
+                EVICTED[1].fetch_add(bytes, Relaxed);
+            }
+        }
+    }
+
+    /// Makes slot `index` neutral if it is still made from `key` and was not
+    /// read within `after` frames before stamp `now`; true if it is neutral
+    /// now (or no longer shows that record).
+    fn demote(&self, index: u32, key: u64, now: u32, after: u32) -> bool {
+        let _made = self.made.lock(index);
+        if self.made.get(index) != Some(key) {
+            return true;
+        }
+        let read = crate::seen::last_read(index);
+        if read != 0 && now.wrapping_sub(read) < after {
+            return false;
+        }
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+            return false;
+        };
+        if !has_neutral(&view) {
+            return false;
+        }
+        self.quick_is(index, 0);
+        self.made.set(index, 0);
+        let kept = neutral_for(&view, self.at(index));
+        self.put(index);
+        self.clear_twin(index);
+        self.keep(index, kept);
+        self.evicted.lock().unwrap_or_else(|e| e.into_inner()).insert(index, now);
+        EVICTED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// Slots made neutral by [`HostHeap::texture_slots_evict`] that the
+    /// card read since are due now (the pass shows their texture again:
+    /// from its host copy if that is still there, else uploaded anew);
+    /// those made again meanwhile (a draw read them through a table, the
+    /// pass served a write of the title's) are forgotten. Returns how many
+    /// woke.
+    pub(crate) fn texture_slots_wake(&self, frame: u64) -> usize {
+        let mut woke = Vec::new();
+        {
+            let mut evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
+            if evicted.is_empty() {
+                return 0;
+            }
+            evicted.retain(|&index, &mut at| {
+                if self.made.get(index).is_some_and(|k| k != 0) {
+                    return false;
+                }
+                let read = crate::seen::last_read(index);
+                if read != 0 && (read.wrapping_sub(at) as i32) > 0 {
+                    woke.push(index);
+                    return false;
+                }
+                true
+            });
+        }
+        if woke.is_empty() {
+            return 0;
+        }
+        EVICTED[3].fetch_add(woke.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
+        for &index in &woke {
+            textures.changed(index, frame, frame);
+        }
+        woke.len()
+    }
+
+    /// Read feedback, every program storing it (`VICTORY_READ_FEEDBACK=2`):
+    /// whether the card read slot `index` within the last
+    /// [`READ_LATELY_FRAMES`] frames before `frame` (by an index or through a
+    /// table).
+    pub(crate) fn texture_slot_read_lately(&self, index: u32, frame: u64) -> bool {
+        let now = crate::seen::stamp_of(frame);
+        let read = crate::seen::last_read(index);
+        if read != 0 && now.wrapping_sub(read) <= READ_LATELY_FRAMES {
+            return true;
+        }
+        let tabled = self.tabled_stamp(index) & !TABLED_READ;
+        tabled != 0 && (now & !TABLED_READ).wrapping_sub(tabled) & !TABLED_READ <= READ_LATELY_FRAMES
+    }
+
+    /// Demand paging while the card is short (read feedback in every
+    /// program): a due slot the card has not read lately is not uploaded;
+    /// it shows the neutral texture (only a slot that showed nothing), and joins the slots
+    /// [`HostHeap::texture_slots_wake`] wakes when a shader reads it. (The
+    /// title writes the views of textures it streamed in around the camera
+    /// long before, or without, a draw of them: uploaded on their write,
+    /// they took the room the textures on screen needed, and a texture let
+    /// go for them came back at once.) False if the slot is served as
+    /// before (a view without a neutral stand-in, a slot showing an older view).
+    pub(crate) fn texture_slot_defer(&self, index: u32, handle: u64, frame: u64) -> bool {
+        let key = record_key(handle);
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+            return false;
+        };
+        if !has_neutral(&view) {
+            return false;
+        }
+        {
+            // Only a slot that shows nothing of the title's yet: one that
+            // shows an older view goes on as before.
+            let _made = self.made.lock(index);
+            if self.made.get(index) != Some(0) {
+                return false;
+            }
+            self.quick_is(index, 0);
+            let kept = neutral_for(&view, self.at(index));
+            self.put(index);
+            self.clear_twin(index);
+            self.keep(index, kept);
+        }
+        self.evicted.lock().unwrap_or_else(|e| e.into_inner()).insert(index, crate::seen::stamp_of(frame));
+        EVICTED[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// Whether the record at `handle` shows a texture whose host copy is
+    /// alive: making a slot from it needs no memory of the card (a slot
+    /// woken after it was made neutral).
+    pub(crate) fn texture_slot_copy_alive(&self, handle: u64) -> bool {
+        let key = record_key(handle);
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+            return false;
+        };
+        shown_texture(&view)
+            .and_then(|this| crate::resource::copy_state(this as crate::object::This))
+            .is_some_and(|(state, ..)| state == 2)
     }
 
     /// Whether host slot `index` shows the placed texture the title's record

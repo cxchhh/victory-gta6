@@ -61,6 +61,17 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// Read feedback (`VICTORY_READ_FEEDBACK=1`, [`super::read_feedback`]): the
+/// root UAV `u<SLOT_READS>` holds one dword per view-heap slot
+/// ([`SLOT_STRIDES_COUNT`] of them). A shader that picks a texture from the
+/// resource heap by an index it computes stores the frame stamp (the
+/// user-data dword of kind [`USER_FRAME`]) at that slot's dword, so the host
+/// knows which slots the card read lately and can let the textures of the
+/// others go while its memory is short.
+pub const SLOT_READS: u8 = 251;
+/// `RootType::Other` code of a user-data dword the host computes: the stamp
+/// of the frame being drawn ([`SLOT_READS`]; never 0).
+pub const USER_FRAME: u32 = 0x108;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// In a directory entry's first dword: shaders do not store there by address

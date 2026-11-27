@@ -315,6 +315,9 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         }
     }
     let us = started.elapsed().as_micros() as u64;
+    if std::thread::current().name() == Some("victory-blocks") {
+        return Ok(());
+    }
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
     MAPPED[2].fetch_max(us, Ordering::Relaxed);
@@ -342,6 +345,10 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     // SAFETY: a live heap or resource of the device's.
     let made = unsafe { device.MakeResident(&[Some(object)]) };
     let us = started.elapsed().as_micros() as u64;
+    // (The thread of blocks waits off the frame's path: `pool::Aside`.)
+    if std::thread::current().name() == Some("victory-blocks") {
+        return made;
+    }
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
     RESIDENT[2].fetch_max(us, Ordering::Relaxed);
@@ -9446,6 +9453,41 @@ impl Meter {
                         if weighed < line { "room" } else { "no room, new textures wait" }
                     );
                 }
+                if crate::pool::blocks_aside() {
+                    let a = crate::pool::ASIDE_COUNTS.each_ref().map(|n| n.load(Ordering::Relaxed));
+                    tracing::info!(
+                        "blocks of texture memory made by their own thread (VICTORY_BLOCKS_ASIDE), since the start: {} in {:.1} ms,                          the longest {:.1} ms; blocks made on the frame's path for want of a ready one: {}",
+                        a[0],
+                        a[1] as f64 / 1000.0,
+                        a[2] as f64 / 1000.0,
+                        a[3]
+                    );
+                }
+                if crate::seen::on() {
+                    let e = crate::descriptor::host::EVICTED.each_ref().map(|n| n.load(Ordering::Relaxed));
+                    let g = crate::resource::EVICTED_GONE.each_ref().map(|n| n.load(Ordering::Relaxed));
+                    let s = crate::descriptor::host::SHOWN_LAST.each_ref().map(|n| n.load(Ordering::Relaxed));
+                    tracing::info!(
+                        "read feedback, since the start: {} textures not read lately let go of ({} MB), {} slots made neutral, \
+                         {} woken by a read again; host copies let go after that {} ({} MB), {} shown again first; walks over \
+                         the slots {}, {} of them with the card short (VICTORY_READ_FEEDBACK); at the last such walk the                          textures shown with a host copy: {} ({} MB), {} never seen read ({} MB), {} read lately ({} MB)",
+                        e[0],
+                        e[1] >> 20,
+                        e[2],
+                        e[3],
+                        g[0],
+                        g[1] >> 20,
+                        g[2],
+                        e[4],
+                        e[5],
+                        s[0],
+                        s[1] >> 20,
+                        s[2],
+                        s[3] >> 20,
+                        s[4],
+                        s[5] >> 20
+                    );
+                }
                 let [looks, mapped, same, staged, all, made, views] =
                     [0, 1, 2, 3, 4, 5, 6].map(|i| crate::draw::HEAP_TEXTURE_NANOS[i].swap(0, Ordering::Relaxed) / 1_000_000);
                 let rest = all.saturating_sub(looks + mapped + same + staged + made + views);
@@ -9974,11 +10016,38 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            p.panel.draw(self, copy, &back, (width, height), format);
-            p.notice.draw(self, copy, &back, (width, height), format);
-            p.menu.draw(self, copy, &back, (width, height), format);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
+            // Read feedback: the card's stamps into the host's copy.
+            crate::seen::copy_back(list, frame);
+            let boxes: Vec<windows::Win32::Foundation::RECT> = [
+                p.panel.draw(self, copy, &back, (width, height), format),
+                p.notice.draw(self, copy, &back, (width, height), format),
+                p.menu.draw(self, copy, &back, (width, height), format),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            // DLSS Frame Generation: the interface's alpha (the title's
+            // interface and these boxes), so that the boxes are put back
+            // unprocessed over generated frames (nothing without it).
+            if let Some(base_format) = planes.map(|(_, _, base_fmt, _)| base_fmt).or_else(|| crate::compose::view(&desc)) {
+                crate::streamline::interface_alpha(
+                    self,
+                    copy,
+                    slot.map_or(0, |i| i + 1),
+                    crate::streamline::Plane {
+                        texture,
+                        state: if composed { state } else { D3D12_RESOURCE_STATE_COPY_SOURCE },
+                        format: base_format,
+                    },
+                    planes.filter(|_| composed).map(|(over, over_state, _, over_fmt)| crate::streamline::Plane {
+                        texture: over,
+                        state: over_state,
+                        format: over_fmt,
+                    }),
+                    &boxes,
+                    [width, height],
+                );
+            }
             if composed {
                 list.ResourceBarrier(&[transition(
                     &back,

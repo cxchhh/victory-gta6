@@ -95,6 +95,14 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
             bytes.push(0);
         }
+        // So is read feedback (`VICTORY_READ_FEEDBACK=1`, `crate::seen`).
+        if victory_shader::emit::read_feedback() {
+            bytes.extend_from_slice(match victory_shader::emit::read_feedback_mode() {
+                1 => b"VICTORY_READ_FEEDBACK=1b",
+                _ => b"VICTORY_READ_FEEDBACK=2b",
+            });
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes

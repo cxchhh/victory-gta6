@@ -2279,6 +2279,7 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
+    let_go_evicted(&all);
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
     if most != u64::MAX {
@@ -2366,6 +2367,117 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Read feedback (`crate::seen`): the title textures whose slots
+/// `HostHeap::texture_slots_evict` made neutral, with their host copy's
+/// bytes and when: [`let_go_idle`] lets their copies go once nothing else
+/// holds them, after a second without a use whatever the card's line says.
+#[cfg(windows)]
+static EVICTED_TEXTURES: std::sync::Mutex<Vec<(usize, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Since the start: host copies let go after their slots were made
+/// neutral, their bytes, and textures shown again before that (their entry
+/// dropped after 20 s, or a slot made from them again).
+#[cfg(windows)]
+pub(crate) static EVICTED_GONE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// For `HostHeap::texture_slots_evict`: the bytes of title texture
+/// `this`'s host copy, if it may be let go once no slot shows it: a texture
+/// the title fills that the host never copied into, its copy alive with no
+/// twin and held by no list, and nothing asked for it for `idle_ms` (a
+/// second at least).
+#[cfg(windows)]
+pub(crate) fn evictable(this: This, idle_ms: u64) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return None;
+    }
+    let at = this as usize;
+    if !textures().contains(&at) {
+        return None;
+    }
+    // SAFETY: in the table (checked just now; a texture leaves it before it
+    // is freed, and the title frees none while its views are in a heap).
+    let r = unsafe { &*(at as *const Resource) };
+    if r.desc.dimension == BUFFER || !fills(&r.desc) || crate::texture::host_wrote(at) {
+        return None;
+    }
+    let used = r.host.used.load(Relaxed);
+    if used == 0 || !crate::host::long_ago(used, idle_ms.max(1000), 4) {
+        return None;
+    }
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let (host, twin) = made.as_ref()?;
+    (twin.is_none() && std::sync::Arc::strong_count(host) == 1).then_some(host.bytes)
+}
+
+/// Title texture `this` (its host copy `bytes`) had every slot made
+/// neutral: [`let_go_idle`] lets it go as soon as it may.
+#[cfg(windows)]
+pub(crate) fn evicted(this: This, bytes: u64) {
+    EVICTED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).push((this as usize, bytes, crate::host::now_ms()));
+}
+
+/// Bytes the read-feedback eviction should still free: how far what
+/// [`room`] weighs is over 3 % of the budget under the queue's line, less
+/// the copies already made neutral and not yet let go. 0 without the
+/// system's numbers.
+#[cfg(windows)]
+pub(crate) fn evict_need() -> u64 {
+    let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+        return 0;
+    };
+    let weighed = used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
+    let aim = room_line(budget).saturating_sub(budget / 100 * 3);
+    let pending: u64 = EVICTED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|e| e.1).sum();
+    weighed.saturating_sub(aim).saturating_sub(pending)
+}
+
+/// [`let_go_idle`]'s part for [`evicted`] textures, under the table's lock
+/// `all`.
+#[cfg(windows)]
+fn let_go_evicted(all: &std::collections::BTreeSet<usize>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut list = EVICTED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if list.is_empty() {
+        return;
+    }
+    let now = crate::host::now_ms();
+    list.retain(|&(at, _, since)| {
+        if !all.contains(&at) {
+            return false;
+        }
+        // SAFETY: in the table, under its lock.
+        let r = unsafe { &*(at as *const Resource) };
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((host, _)) = made.as_ref() else {
+            return false;
+        };
+        let free = crate::host::long_ago(r.host.used.load(Relaxed), 1000, 4)
+            && std::sync::Arc::strong_count(host) == 1
+            && crate::host::references(&host.texture) == 1;
+        if !free {
+            // Shown again (a slot made from it), or still held by a
+            // submission that ran with it: looked at again for 20 s.
+            if now.saturating_sub(since) > 20_000 {
+                EVICTED_GONE[2].fetch_add(1, Relaxed);
+                return false;
+            }
+            return true;
+        }
+        crate::texture::unstage(at as This);
+        r.host.wanted.store(u32::MAX, Relaxed);
+        let Some((host, _)) = made.take() else { return false };
+        drop(made);
+        r.host.gone.store(true, Relaxed);
+        KINDS[2].fetch_add(1, Relaxed);
+        KINDS[3].fetch_add(host.bytes, Relaxed);
+        EVICTED_GONE[0].fetch_add(1, Relaxed);
+        EVICTED_GONE[1].fetch_add(host.bytes, Relaxed);
+        crate::host::retire(host);
+        false
+    });
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
