@@ -6,6 +6,45 @@ Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox
 
 [Quick start](#getting-started) · [Gameplay](#gameplay) · [Measurements](#measurements) · [Benchmark dashboard](https://taynangt.github.io/Vice-Tay/)
 
+## This fork: cxchhh/victory-gta6 `main`
+
+Vice-Tay (`77281855`) with five changes on top, run on an **RTX 4070 (12 GB), Core i5-13600KF, 32 GB, Windows 11 Pro (26200)**, Series X profile.
+
+| Change | Commit |
+| --- | --- |
+| **Stretched characters and railings fixed.** While the player or the camera moved, vertices of skinned characters and nearby objects flew off into long sheets for one or two frames. The title writes a few constant buffers again *after* it sends the submission that reads them (on the console the card reads them when the draw runs); card steps (`VICTORY_CARD_STEPS`, on in `play.ps1`) read them when the submission is prepared. Port of [avatarmanz/VIctory-7900XTX#434](https://github.com/avatarmanz/VIctory-7900XTX/pull/434): places found written after sending are learned, and a submission with a fill there waits as without card steps. Checked by eye on this PC: no stretching, textures and shadows steady. | `0b7c81649` |
+| Keyboard layout of the stand-in pad (below) | `b606501d6`, `9597893fd` |
+| Shader cache key from the translator's own source (`build.rs` read `CARGO_MANIFEST_DIR` at compile time, so translator changes did not change the key) | `e8811be05` |
+| Frames captured on demand: a file `take` in the `VICTORY_CAPTURE` folder (diagnostics) | `df104a743` |
+
+### Keys (keyboard as the pad)
+
+| Pad | Key | | Pad | Key |
+| --- | --- | --- | --- | --- |
+| A | **Space** | | Left stick | W A S D |
+| B | Backspace | | Right stick | I J K L |
+| X / Y | X / Y | | Left / right trigger | Z / C |
+| Menu / View | Esc / Tab | | Left / right shoulder | Q / E |
+| D-pad | Arrow keys | | Left stick click (L3) | **Left Shift** |
+| | | | Right stick click (R3) | **Middle mouse button** |
+
+### Our measurements (RTX 4070)
+
+`scripts\play.ps1 -Machine 4070` settings, diagnostics build, one run each with the player moving, so scenes differ between rows; compare rows of similar draw counts only.
+
+| Build and output | Draws a frame | Frame time | Notes |
+| --- | --- | --- | --- |
+| Vice-Tay `77281855`, `VICTORY_OUTPUT=2560x1440` (renders 1707x960) | ~6,000 | 42-48 ms (21-24 FPS) | stretched vertices while moving |
+| same | 10,000-12,800 | ~78 ms (12.8 FPS) | |
+| this `main`, `VICTORY_OUTPUT=2560x1440` | 5,600 | 73 ms (13.6 FPS) | no stretching |
+| same | 6,600 | 94-107 ms | |
+| this `main`, `VICTORY_OUTPUT=1920x1080 VICTORY_RENDER_SCALE=1.0` (renders 1920x1080) | 5,300-6,300 | 70-77 ms (13-14 FPS) | mean of four 20 s phases in one run |
+| our previous tree (`try-flat`), 2560x1440 | 6,400-7,500 | 94-112 ms | for reference |
+
+What the fix costs: about three submissions a frame wait for the flights ahead of them, **~23 ms a frame** of the submitting thread (0.1 ms before the fix), and the submitting thread is what bounds the frame here (70 of 73 ms busy, the card about 58% busy). A gate that let those submissions go and held only the learned fills on the card (`VICTORY_LATE_GATE`, not in this branch) was measured in one run against the fix alone and was about 10 ms slower.
+
+**Output size.** With `VICTORY_OUTPUT=2560x1440` the title renders at two thirds of it (1707x960) and lays its interface out for 1440p, which looks crowded; its separate 4K interface plane is only made for 1080p and 720p. `VICTORY_OUTPUT=1920x1080 VICTORY_RENDER_SCALE=1.0` gives the 4K interface layout scaled down and a 1920x1080 render.
+
 ## Measurements
 
 The goal is **30 rendered FPS in the open world with correct visuals**. Both sessions used the Series S profile.
