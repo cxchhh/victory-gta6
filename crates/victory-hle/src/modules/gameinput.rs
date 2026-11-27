@@ -1330,6 +1330,7 @@ mod host {
     fn key_code(key: &str) -> Option<u8> {
         Some(match key {
             "Enter" => 0x0D,
+            "Space" => 0x20,
             "Esc" => 0x1B,
             "Tab" => 0x09,
             "Back" => 0x08,
