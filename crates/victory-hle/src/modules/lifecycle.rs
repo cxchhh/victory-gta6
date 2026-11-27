@@ -121,6 +121,36 @@ fn fullscreen(hwnd: HWND) {
     }
 }
 
+/// The keyboard reaches the title as keys, not as text. An input method
+/// (a Chinese or Japanese one, the user's default on this PC) takes letter
+/// keys and Enter for its own composition and pops its candidates over the
+/// window: the title, which reads key states, walks nowhere and its menus
+/// do not go on. So the title's window has no input method, and this
+/// process the US layout; the system's settings and other programs are
+/// left alone. On by default; `VICTORY_KEEP_IME=1` keeps what the user has.
+/// (`VICTORY_IME_ENGLISH=1` below only switches to an installed en-US
+/// layout, and leaves the input method on the window.)
+fn keys_not_text(hwnd: HWND) {
+    use windows_sys::Win32::UI::Input::Ime::ImmAssociateContextEx;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{KLF_ACTIVATE, KLF_SETFORPROCESS, LoadKeyboardLayoutW};
+    if enabled("VICTORY_KEEP_IME") {
+        return;
+    }
+    // SAFETY: a window this thread just created; no input context (null)
+    // and no flags take the window's input method away.
+    let (ime_off, layout) = unsafe {
+        (
+            ImmAssociateContextEx(hwnd, std::ptr::null_mut(), 0) != 0,
+            LoadKeyboardLayoutW(w!("00000409"), KLF_ACTIVATE | KLF_SETFORPROCESS),
+        )
+    };
+    tracing::info!(
+        ime_off,
+        us_layout = !layout.is_null(),
+        "keyboard: the title's window without an input method, US layout for this process (VICTORY_KEEP_IME=1 keeps the user's)"
+    );
+}
+
 fn english_input() {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse as kb;
     if !enabled("VICTORY_IME_ENGLISH") {
@@ -349,6 +379,7 @@ fn hook(hwnd: HWND) {
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
         if wm::GetParent(hwnd).is_null() {
             fullscreen(hwnd);
+            keys_not_text(hwnd);
             english_input();
             capture_mouse(hwnd, true);
         }
