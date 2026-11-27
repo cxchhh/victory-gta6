@@ -1,5 +1,59 @@
 # VIctory on NVIDIA
 
+## This fork: cxchhh/victory-gta6 `main`
+
+`main` is now [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)
+with our key layout. The previous `main` (the Vice-Tay base with the #434
+stretch fix) is kept on the `vice-tay` branch.
+
+**Why this base.** Measured on one RTX 4070 PC at the same spot (standing
+at the balcony after loading, Series S profile):
+
+| Base | Frame time | Draws a frame | Waiting for the GPU's earlier work |
+| --- | --- | --- | --- |
+| Vice-Tay (previous `main`) | 60 ms (16.5 fps) | 6,700 | 15.1 ms a frame |
+| VIctory-NVIDIA (this `main`) | 50 ms (about 20 fps) | 8,450 | 1.5 ms a frame |
+
+It also draws without the stretched characters, with no waiting for it.
+
+**Recommended start (4K UI, light rendering, DLSS and frame generation):**
+
+```
+victory.exe play --res 4k --dlss performance --framegen 2
+```
+
+- `--res 4k`: the title's own 3840x2160 output, so the interface is drawn
+  at native 4K (the window scales it to a 1440p screen correctly; a 1440p
+  output lays the interface out wrongly).
+- `--dlss performance`: the scene is drawn at 1920x1080 and DLSS brings it
+  to 4K.
+- `--framegen 2`: DLSS frame generation (RTX 40 or later), two frames shown
+  for each one drawn.
+- Run `Get-NVIDIA-DLSS.cmd` once first (NVIDIA's own files, about 70 MB).
+
+On the RTX 4070 this shows 22-28 fps in town and 30-40 fps while driving or
+on a boat. Known issue: after long drives video memory fills up and new
+areas' textures load late or stay black; that is what we are working on.
+
+**Keys (keyboard as the stand-in pad):**
+
+| Key | Pad |
+| --- | --- |
+| W A S D | left stick |
+| I J K L | right stick (camera) |
+| Space, Enter | A |
+| Backspace | B |
+| X | X |
+| F | Y |
+| Q / E | LB / RB |
+| Z / C | LT / RT |
+| Left Shift | L3 (left stick click) |
+| Middle mouse button | R3 (right stick click) |
+| Arrow keys | d-pad |
+| Esc / Tab | Menu / View |
+| F1 / F3 | settings menu / stats panel |
+
+
 ## Frame generation: what your card supports
 
 | Your card | Frame generation | Limits |
